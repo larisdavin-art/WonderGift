@@ -1060,7 +1060,7 @@ PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "reftop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
-    "roulette", "dice", "mines", "exchange",
+    "roulette", "dice", "mines", "exchange", "admin",
 }
 
 RUSSIAN_COMMANDS = {
@@ -1073,6 +1073,7 @@ RUSSIAN_COMMANDS = {
     "промо": "promo", "перевод": "transfer", "слоты": "slots",
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
     "удалитьзаявку": "deletepending",
+    "админ": "admin", "админка": "admin",
 }
 
 def parse_plain_command(text: str | None):
@@ -1092,7 +1093,7 @@ def parse_plain_command(text: str | None):
 def is_plain_command(message: Message) -> bool:
     return parse_plain_command(message.text) is not None
 
-def start_keyboard():
+def start_keyboard(is_admin: bool = False):
     buttons = [
         [InlineKeyboardButton(text="🔗 Реферальная ссылка", callback_data="ref")],
         [InlineKeyboardButton(text="📊 Реферальная статистика", callback_data="refstats")],
@@ -1100,6 +1101,8 @@ def start_keyboard():
         [InlineKeyboardButton(text="⭐ Купить D-COINS", callback_data="buy_dc_menu")],
         [InlineKeyboardButton(text="❓ Как играть", callback_data="help")],
     ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def subscription_keyboard() -> InlineKeyboardMarkup:
@@ -1175,7 +1178,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         return
     await message.answer(
         "👋 Добро пожаловать!\n\nВыберите действие:",
-        reply_markup=start_keyboard()
+        reply_markup=start_keyboard(message.from_user.id == ADMIN_ID)
     )
 
 @router.callback_query(F.data == "check_subscription")
@@ -1185,7 +1188,7 @@ async def check_subscription(callback: CallbackQuery, bot: Bot) -> None:
         return
     await callback.message.edit_text(
         "👋 Добро пожаловать!\n\nВыберите действие:",
-        reply_markup=start_keyboard(),
+        reply_markup=start_keyboard(callback.from_user.id == ADMIN_ID),
     )
     await callback.answer("✅ Подписка подтверждена")
 
@@ -1929,6 +1932,278 @@ async def cmd_premiumrefund(message: Message, bot: Bot) -> None:
         )
     except Exception as e:
         logger.warning("Could not notify Premium refund recipient: %s", e)
+
+# =========================
+# ADMIN PANEL
+# =========================
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Pending", callback_data="admin_pending"),
+            InlineKeyboardButton(text="💎 Premium", callback_data="admin_premium"),
+        ],
+        [
+            InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promos"),
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users"),
+        ],
+        [InlineKeyboardButton(text="💰 Экономика", callback_data="admin_economy")],
+        [InlineKeyboardButton(text="🛠 Команды", callback_data="admin_commands")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_panel")],
+    ])
+
+def admin_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")]
+    ])
+
+async def admin_dashboard_text(bot: Bot) -> str:
+    pending_count = len(await db.get_pending_gifts())
+    premium_count = len(await db.get_premium_orders())
+    promo_count = len(await db.get_promos())
+    ban_count = len(await db.get_ban_list())
+    try:
+        star_balance = (await bot.get_my_star_balance()).amount
+        stars_text = f"{star_balance}⭐"
+    except Exception:
+        stars_text = "недоступен"
+    updated_at = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%H:%M:%S МСК")
+    return (
+        "🛠 Админ-панель\n\n"
+        f"📋 Подарков в pending: {pending_count}\n"
+        f"💎 Заявок Premium: {premium_count}\n"
+        f"🎟 Активных промокодов: {promo_count}\n"
+        f"🚫 Заблокировано: {ban_count}\n"
+        f"⭐ Баланс бота: {stars_text}\n"
+        f"🔄 Обновлено: {updated_at}"
+    )
+
+@router.message(Command("admin"), F.chat.type == "private")
+async def cmd_admin(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(await admin_dashboard_text(bot), reply_markup=admin_panel_keyboard())
+
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(await admin_dashboard_text(bot), reply_markup=admin_panel_keyboard())
+    await callback.answer()
+
+async def render_admin_pending(callback: CallbackQuery, bot: Bot, notice: str = "") -> None:
+    gifts = await db.get_pending_gifts()
+    text = (notice + "\n\n" if notice else "") + f"📋 Pending-подарки: {len(gifts)}\n"
+    buttons = []
+    if not gifts:
+        text += "\nОчередь пуста."
+    else:
+        text += "\nПоказаны первые 10 заявок:\n\n"
+        for gift_id, user_id, user_name, telegram_gift_id, reason, _ in gifts[:10]:
+            text += f"#{gift_id} — {user_name} ({user_id})\n🎁 {telegram_gift_id}\n📝 {reason}\n\n"
+            buttons.append([
+                InlineKeyboardButton(text=f"✅ Выдать #{gift_id}", callback_data=f"admin_deliver_{gift_id}"),
+                InlineKeyboardButton(text=f"🗑 Удалить #{gift_id}", callback_data=f"admin_dropgift_{gift_id}"),
+            ])
+    buttons.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")])
+    await callback.message.edit_text(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@router.callback_query(F.data == "admin_pending")
+async def admin_pending_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await render_admin_pending(callback, bot)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin_deliver_"))
+async def admin_deliver_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        gift_db_id = int(callback.data.removeprefix("admin_deliver_"))
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Неверный ID", show_alert=True)
+        return
+    gift = next((item for item in await db.get_pending_gifts() if item[0] == gift_db_id), None)
+    if not gift:
+        await render_admin_pending(callback, bot, "ℹ️ Заявка уже обработана.")
+        await callback.answer()
+        return
+    _, user_id, user_name, telegram_gift_id, _, _ = gift
+    try:
+        await bot.send_gift(user_id=user_id, gift_id=telegram_gift_id)
+        await db.remove_pending_gift(gift_db_id)
+        await send_log(bot, f"🎁 Подарок #{gift_db_id} выдан через админ-панель\n{user_name} ({user_id})")
+        await render_admin_pending(callback, bot, f"✅ Подарок #{gift_db_id} выдан.")
+        await callback.answer("✅ Выдано")
+    except Exception as e:
+        await callback.answer(f"❌ Не удалось выдать: {str(e)[:150]}", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_dropgift_"))
+async def admin_dropgift_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        gift_db_id = int(callback.data.removeprefix("admin_dropgift_"))
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Неверный ID", show_alert=True)
+        return
+    gift = next((item for item in await db.get_pending_gifts() if item[0] == gift_db_id), None)
+    if gift:
+        await db.remove_pending_gift(gift_db_id)
+        notice = f"🗑 Заявка #{gift_db_id} удалена."
+    else:
+        notice = "ℹ️ Заявка уже обработана."
+    await render_admin_pending(callback, bot, notice)
+    await callback.answer()
+
+async def render_admin_premium(callback: CallbackQuery, notice: str = "") -> None:
+    orders = await db.get_premium_orders()
+    text = (notice + "\n\n" if notice else "") + f"💎 Заявки Premium: {len(orders)}\n"
+    buttons = []
+    if not orders:
+        text += "\nОчередь пуста."
+    else:
+        text += "\nПоказаны первые 10 заявок:\n\n"
+        for order_id, user_id, user_name, cost, _ in orders[:10]:
+            text += f"#{order_id} — {user_name} ({user_id})\n🪙 {cost:,} DC\n\n".replace(",", " ")
+            buttons.append([
+                InlineKeyboardButton(text=f"✅ Выдан #{order_id}", callback_data=f"admin_premiumdone_{order_id}"),
+                InlineKeyboardButton(text=f"↩️ Возврат #{order_id}", callback_data=f"admin_premiumrefund_{order_id}"),
+            ])
+    buttons.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")])
+    await callback.message.edit_text(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@router.callback_query(F.data == "admin_premium")
+async def admin_premium_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await render_admin_premium(callback)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin_premiumdone_"))
+async def admin_premiumdone_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    order_id = int(callback.data.removeprefix("admin_premiumdone_"))
+    order = next((item for item in await db.get_premium_orders() if item[0] == order_id), None)
+    if not order:
+        await render_admin_premium(callback, "ℹ️ Заявка уже обработана.")
+        await callback.answer()
+        return
+    _, user_id, user_name, _, _ = order
+    await db.remove_premium_order(order_id)
+    try:
+        await bot.send_message(user_id, "💎 Premium на месяц выдан. Спасибо за обмен!")
+    except Exception as e:
+        logger.warning("Could not notify Premium recipient: %s", e)
+    await render_admin_premium(callback, f"✅ Premium #{order_id} отмечен как выданный: {user_name}.")
+    await callback.answer("✅ Готово")
+
+@router.callback_query(F.data.startswith("admin_premiumrefund_"))
+async def admin_premiumrefund_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    order_id = int(callback.data.removeprefix("admin_premiumrefund_"))
+    order = next((item for item in await db.get_premium_orders() if item[0] == order_id), None)
+    if not order:
+        await render_admin_premium(callback, "ℹ️ Заявка уже обработана.")
+        await callback.answer()
+        return
+    _, user_id, user_name, cost, _ = order
+    new_balance = await db.add_coins(user_id, cost)
+    await db.remove_premium_order(order_id)
+    try:
+        await bot.send_message(user_id, f"↩️ Тебе вернули {cost:,} DC. Баланс: {new_balance:,} DC".replace(",", " "))
+    except Exception as e:
+        logger.warning("Could not notify Premium refund recipient: %s", e)
+    await render_admin_premium(callback, f"↩️ {cost:,} DC возвращено игроку {user_name}.".replace(",", " "))
+    await callback.answer("↩️ Возвращено")
+
+@router.callback_query(F.data == "admin_promos")
+async def admin_promos_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    promos = await db.get_promos()
+    text = f"🎟 Активные промокоды: {len(promos)}\n\n"
+    if promos:
+        for code, reward, reward_type, case_id, case_count, max_uses, uses in promos[:30]:
+            limit = f"{uses}/{max_uses}" if max_uses is not None else f"{uses}/∞"
+            prize = f"{CASES[case_id]['title']} × {case_count}" if reward_type == "case" else f"{reward:,} DC".replace(",", " ")
+            text += f"• {code} — {prize} ({limit})\n"
+    else:
+        text += "Промокодов нет."
+    text += "\nСоздать: createpromo КОД DC ЛИМИТ\nКейс: createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ\nУдалить: deletepromo КОД"
+    await callback.message.edit_text(text[:4000], reply_markup=admin_back_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    async with aiosqlite.connect(db.path) as conn:
+        async with conn.execute(
+            "SELECT v.user_id, COALESCE(u.user_name, CAST(v.user_id AS TEXT)) "
+            "FROM vip_users v LEFT JOIN user_stats u ON u.user_id=v.user_id AND u.chat_id=? LIMIT 20",
+            (MAIN_CHAT_ID,),
+        ) as cur:
+            vip_rows = await cur.fetchall()
+    bans = await db.get_ban_list()
+    text = f"👥 Пользователи\n\n👑 VIP: {len(vip_rows)}\n"
+    text += "\n".join(f"• {name} ({uid})" for uid, name in vip_rows) if vip_rows else "Нет VIP"
+    text += f"\n\n🚫 Заблокировано: {len(bans)}\n"
+    text += "\n".join(f"• {name} ({uid}) — {reason or 'без причины'}" for uid, name, reason in bans[:20]) if bans else "Список пуст"
+    text += "\n\nУправление: vip ID, unvip ID, ban ID причина, unban ID"
+    await callback.message.edit_text(text[:4000], reply_markup=admin_back_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_economy")
+async def admin_economy_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    packages = "\n".join(f"• {dc:,} DC — {stars}⭐".replace(",", " ") for dc, stars in STAR_DC_PACKAGES.items())
+    case_prices = "\n".join(f"• {case['title']} — {case['price']:,} DC".replace(",", " ") for case in CASES.values())
+    text = (
+        "💰 Экономика\n\n"
+        f"📈 +1% шанса — {EXCHANGE_CHANCE:,} DC\n"
+        f"🎁 15⭐ — {EXCHANGE_GIFT_15:,} DC\n"
+        f"🎁 25⭐ — {EXCHANGE_GIFT_25:,} DC\n"
+        f"🎁 50⭐ — {EXCHANGE_GIFT_50:,} DC\n"
+        f"🎁 100⭐ — {EXCHANGE_GIFT_100:,} DC\n"
+        f"💎 Premium — {EXCHANGE_PREMIUM_1_MONTH:,} DC\n\n"
+        f"⭐ Покупка DC:\n{packages}\n\n📦 Кейсы:\n{case_prices}"
+    ).replace(",", " ")
+    await callback.message.edit_text(text[:4000], reply_markup=admin_back_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_commands")
+async def admin_commands_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🛠 Основные админ-команды\n\n"
+        "addcoins ID СУММА / removecoins ID СУММА\n"
+        "addmsgs ID КОЛ-ВО / removemsgs ID КОЛ-ВО\n"
+        "vip ID / unvip ID / ban ID ПРИЧИНА / unban ID\n"
+        "createpromo КОД DC ЛИМИТ\n"
+        "createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ\n"
+        "promos / pending / premiumorders\n"
+        "say ТЕКСТ — сообщение в основную группу\n"
+        "popolnit — пополнить баланс звёзд бота",
+        reply_markup=admin_back_keyboard(),
+    )
+    await callback.answer()
 
 # =========================
 # GROUP — /stats
@@ -3031,13 +3306,13 @@ PRIVATE_PLAIN_COMMANDS = {
     "addcoins", "removecoins", "createpromo", "deletepromo", "createcasepromo",
     "promos", "addrefs", "removerefs", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
-    "promo", "cases", "slots", "roulette", "dice", "mines",
+    "promo", "cases", "slots", "roulette", "dice", "mines", "admin",
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "reftop", "cointop", "daytop", "bonus"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "ref", "say", "addrefs", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
-    "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice",
+    "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "admin",
 }
 PLAIN_COMMAND_HANDLERS = {
     "start": cmd_start, "help": cmd_help, "ref": cmd_ref, "refstats": cmd_refstats,
@@ -3058,7 +3333,7 @@ PLAIN_COMMAND_HANDLERS = {
     "promo": cmd_promo, "transfer": cmd_transfer, "daytop": cmd_daytop,
     "bonus": cmd_bonus, "cases": cmd_cases, "slots": cmd_slots,
     "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines,
-    "exchange": cmd_exchange,
+    "exchange": cmd_exchange, "admin": cmd_admin,
 }
 
 @router.message(is_plain_command)
