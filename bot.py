@@ -114,6 +114,18 @@ CASES = {
     },
 }
 
+# Изменяемые настройки экономики. Значения загружаются из SQLite при старте,
+# поэтому правки из админ-панели переживают перезапуск и новый деплой.
+ECONOMY_DEFAULTS = {
+    "chance_price": EXCHANGE_CHANCE,
+    "gift_15": EXCHANGE_GIFT_15,
+    "gift_25": EXCHANGE_GIFT_25,
+    "gift_50": EXCHANGE_GIFT_50,
+    "gift_100": EXCHANGE_GIFT_100,
+    "premium_1m": EXCHANGE_PREMIUM_1_MONTH,
+}
+ECONOMY = dict(ECONOMY_DEFAULTS)
+
 BAN_MESSAGE = "🚫 Вы заблокированы и не можете участвовать в розыгрышах в боте."
 
 POPOLNIT_AMOUNT = 50
@@ -282,6 +294,13 @@ class Database:
                     PRIMARY KEY (user_id, case_id)
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key        TEXT PRIMARY KEY,
+                    value      REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
             async with db.execute("PRAGMA table_info(promo_codes)") as cur:
                 promo_columns = [row[1] for row in await cur.fetchall()]
             if "reward_type" not in promo_columns:
@@ -404,6 +423,20 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
+
+    async def get_settings(self) -> dict[str, float]:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("SELECT key, value FROM app_settings") as cur:
+                return {key: float(value) for key, value in await cur.fetchall()}
+
+    async def set_setting(self, key: str, value: float) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, float(value), time.time()),
+            )
+            await db.commit()
 
     # --------------------------------------------------
     # USER STATS
@@ -913,6 +946,54 @@ class Database:
 
 db = Database(os.getenv("DB_PATH", "activity.db"))
 
+
+def economy_price(key: str) -> int:
+    return int(ECONOMY[key])
+
+
+def case_reward_parts(reward: tuple) -> tuple[str, int, float]:
+    if isinstance(reward[0], str):
+        kind, value, weight = reward
+    else:
+        value, weight = reward
+        kind = "coins"
+    return kind, int(value), float(weight)
+
+
+def case_reward_tuple(original: tuple, weight: float) -> tuple:
+    if isinstance(original[0], str):
+        return original[0], original[1], float(weight)
+    return original[0], float(weight)
+
+
+async def load_runtime_settings() -> None:
+    settings = await db.get_settings()
+    for key in ECONOMY:
+        stored = settings.get(f"economy:{key}")
+        if stored is not None and stored >= 1:
+            ECONOMY[key] = int(stored)
+    for dc_amount in STAR_DC_PACKAGES:
+        stored = settings.get(f"stars:{dc_amount}")
+        if stored is not None and stored >= 1:
+            STAR_DC_PACKAGES[dc_amount] = int(stored)
+    for case_id, case in CASES.items():
+        updated_rewards = []
+        for index, reward in enumerate(case["rewards"]):
+            stored = settings.get(f"case_chance:{case_id}:{index}")
+            updated_rewards.append(case_reward_tuple(reward, stored if stored is not None else case_reward_parts(reward)[2]))
+        total_weight = sum(case_reward_parts(reward)[2] for reward in updated_rewards)
+        if total_weight > 0:
+            updated_rewards = [
+                case_reward_tuple(reward, case_reward_parts(reward)[2] * 100.0 / total_weight)
+                for reward in updated_rewards
+            ]
+        case["rewards"] = updated_rewards
+
+
+async def save_case_chances(case_id: str) -> None:
+    for index, reward in enumerate(CASES[case_id]["rewards"]):
+        await db.set_setting(f"case_chance:{case_id}:{index}", case_reward_parts(reward)[2])
+
 # =========================
 # HELPERS
 # =========================
@@ -1128,12 +1209,12 @@ async def send_subscription_prompt(message: Message) -> None:
 
 def exchange_keyboard(balance: int):
     buttons = [
-        [InlineKeyboardButton(text=f"📈 {EXCHANGE_CHANCE:,} DC → +1% шанса".replace(",", " "), callback_data="exch_chance")],
-        [InlineKeyboardButton(text=f"🎁 {EXCHANGE_GIFT_15:,} DC → подарок 15⭐".replace(",", " "), callback_data="exch_gift_15")],
-        [InlineKeyboardButton(text=f"🎁 {EXCHANGE_GIFT_25:,} DC → подарок 25⭐".replace(",", " "), callback_data="exch_gift_25")],
-        [InlineKeyboardButton(text=f"🎁 {EXCHANGE_GIFT_50:,} DC → подарок 50⭐".replace(",", " "), callback_data="exch_gift_50")],
-        [InlineKeyboardButton(text=f"🎁 {EXCHANGE_GIFT_100:,} DC → подарок 100⭐".replace(",", " "), callback_data="exch_gift_100")],
-        [InlineKeyboardButton(text=f"💎 {EXCHANGE_PREMIUM_1_MONTH:,} DC → Premium на месяц".replace(",", " "), callback_data="exch_premium_1m")],
+        [InlineKeyboardButton(text=f"📈 {economy_price('chance_price'):,} DC → +1% шанса".replace(",", " "), callback_data="exch_chance")],
+        [InlineKeyboardButton(text=f"🎁 {economy_price('gift_15'):,} DC → подарок 15⭐".replace(",", " "), callback_data="exch_gift_15")],
+        [InlineKeyboardButton(text=f"🎁 {economy_price('gift_25'):,} DC → подарок 25⭐".replace(",", " "), callback_data="exch_gift_25")],
+        [InlineKeyboardButton(text=f"🎁 {economy_price('gift_50'):,} DC → подарок 50⭐".replace(",", " "), callback_data="exch_gift_50")],
+        [InlineKeyboardButton(text=f"🎁 {economy_price('gift_100'):,} DC → подарок 100⭐".replace(",", " "), callback_data="exch_gift_100")],
+        [InlineKeyboardButton(text=f"💎 {economy_price('premium_1m'):,} DC → Premium на месяц".replace(",", " "), callback_data="exch_premium_1m")],
         [InlineKeyboardButton(text="⭐ Купить DC за звёзды", callback_data="buy_dc_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1751,12 +1832,15 @@ async def successful_payment_handler(message: Message, bot: Bot) -> None:
     if not payment.invoice_payload.startswith("buy_dc_"):
         return
     try:
-        dc_amount = int(payment.invoice_payload.removeprefix("buy_dc_"))
-    except ValueError:
+        payload_parts = payment.invoice_payload.removeprefix("buy_dc_").split("_")
+        dc_amount = int(payload_parts[0])
+        invoice_star_amount = int(payload_parts[1]) if len(payload_parts) > 1 else None
+    except (ValueError, IndexError):
         logger.warning("Unknown Stars payment payload: %s", payment.invoice_payload)
         return
-    star_amount = STAR_DC_PACKAGES.get(dc_amount)
-    if star_amount is None or payment.total_amount != star_amount or payment.currency != "XTR":
+    current_star_amount = STAR_DC_PACKAGES.get(dc_amount)
+    star_amount = invoice_star_amount if invoice_star_amount is not None else current_star_amount
+    if current_star_amount is None or star_amount is None or payment.total_amount != star_amount or payment.currency != "XTR":
         logger.warning("Invalid Stars payment: payload=%s amount=%s", payment.invoice_payload, payment.total_amount)
         return
     credited, new_balance = await db.credit_star_coin_purchase(
@@ -2134,22 +2218,51 @@ async def admin_promos_callback(callback: CallbackQuery) -> None:
         return
     promos = await db.get_promos()
     text = f"🎟 Активные промокоды: {len(promos)}\n\n"
+    buttons = []
     if promos:
         for code, reward, reward_type, case_id, case_count, max_uses, uses in promos[:30]:
             limit = f"{uses}/{max_uses}" if max_uses is not None else f"{uses}/∞"
             prize = f"{CASES[case_id]['title']} × {case_count}" if reward_type == "case" else f"{reward:,} DC".replace(",", " ")
             text += f"• {code} — {prize} ({limit})\n"
+            callback_data = f"admin_promodel:{code}"
+            confirm_data = f"admin_promoconfirm:{code}"
+            if len(confirm_data.encode("utf-8")) <= 64:
+                buttons.append([InlineKeyboardButton(text=f"🗑 {code}", callback_data=callback_data)])
     else:
         text += "Промокодов нет."
-    text += "\nСоздать: createpromo КОД DC ЛИМИТ\nКейс: createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ\nУдалить: deletepromo КОД"
-    await callback.message.edit_text(text[:4000], reply_markup=admin_back_keyboard())
+    text += "\nСоздать: createpromo КОД DC ЛИМИТ\nКейс: createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ"
+    buttons.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")])
+    await callback.message.edit_text(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
-@router.callback_query(F.data == "admin_users")
-async def admin_users_callback(callback: CallbackQuery) -> None:
+
+@router.callback_query(F.data.startswith("admin_promodel:"))
+async def admin_promo_delete_callback(callback: CallbackQuery) -> None:
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
+    code = callback.data.removeprefix("admin_promodel:")
+    await callback.message.edit_text(
+        f"🗑 Удалить промокод {code}?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"admin_promoconfirm:{code}")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_promos")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_promoconfirm:"))
+async def admin_promo_delete_confirm_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    code = callback.data.removeprefix("admin_promoconfirm:")
+    await db.delete_promo(code)
+    # Повторно рисуем список без удалённого промокода.
+    await admin_promos_callback(callback)
+
+async def render_admin_users(callback: CallbackQuery) -> None:
     async with aiosqlite.connect(db.path) as conn:
         async with conn.execute(
             "SELECT v.user_id, COALESCE(u.user_name, CAST(v.user_id AS TEXT)) "
@@ -2158,32 +2271,279 @@ async def admin_users_callback(callback: CallbackQuery) -> None:
         ) as cur:
             vip_rows = await cur.fetchall()
     bans = await db.get_ban_list()
+    buttons = []
     text = f"👥 Пользователи\n\n👑 VIP: {len(vip_rows)}\n"
     text += "\n".join(f"• {name} ({uid})" for uid, name in vip_rows) if vip_rows else "Нет VIP"
+    for uid, name in vip_rows:
+        buttons.append([InlineKeyboardButton(text=f"👑 Убрать VIP: {name}", callback_data=f"admin_unvip:{uid}")])
     text += f"\n\n🚫 Заблокировано: {len(bans)}\n"
     text += "\n".join(f"• {name} ({uid}) — {reason or 'без причины'}" for uid, name, reason in bans[:20]) if bans else "Список пуст"
-    text += "\n\nУправление: vip ID, unvip ID, ban ID причина, unban ID"
-    await callback.message.edit_text(text[:4000], reply_markup=admin_back_keyboard())
+    for uid, name, _ in bans[:20]:
+        buttons.append([InlineKeyboardButton(text=f"🔓 Разбанить: {name}", callback_data=f"admin_unban:{uid}")])
+    text += "\n\nДобавление: vip ID или ban ID ПРИЧИНА"
+    buttons.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")])
+    await callback.message.edit_text(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await render_admin_users(callback)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_unvip:"))
+async def admin_unvip_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        user_id = int(callback.data.removeprefix("admin_unvip:"))
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Неверный ID", show_alert=True)
+        return
+    await db.remove_vip(user_id)
+    await render_admin_users(callback)
+    await callback.answer("✅ VIP снят")
+
+
+@router.callback_query(F.data.startswith("admin_unban:"))
+async def admin_unban_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        user_id = int(callback.data.removeprefix("admin_unban:"))
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Неверный ID", show_alert=True)
+        return
+    await db.unban_user(user_id)
+    await render_admin_users(callback)
+    await callback.answer("✅ Пользователь разбанен")
+
+ECONOMY_PRICE_META = {
+    "chance_price": ("📈 +1% шанса", 1000),
+    "gift_15": ("🎁 Подарок 15⭐", 10000),
+    "gift_25": ("🎁 Подарок 25⭐", 10000),
+    "gift_50": ("🎁 Подарок 50⭐", 10000),
+    "gift_100": ("🎁 Подарок 100⭐", 10000),
+    "premium_1m": ("💎 Premium 1 месяц", 50000),
+}
+
+
+def admin_economy_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Цены обмена", callback_data="admin_econ_exchange")],
+        [InlineKeyboardButton(text="⭐ Покупка DC", callback_data="admin_econ_stars")],
+        [InlineKeyboardButton(text="🎲 Шансы кейсов", callback_data="admin_econ_cases")],
+        [InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")],
+    ])
+
+
+async def render_admin_economy(callback: CallbackQuery) -> None:
+    text = (
+        "💰 Управление экономикой\n\n"
+        "Все изменения применяются сразу и сохраняются после перезапуска бота.\n"
+        "Выбери раздел:"
+    )
+    await callback.message.edit_text(text, reply_markup=admin_economy_keyboard())
+
 
 @router.callback_query(F.data == "admin_economy")
 async def admin_economy_callback(callback: CallbackQuery) -> None:
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
-    packages = "\n".join(f"• {dc:,} DC — {stars}⭐".replace(",", " ") for dc, stars in STAR_DC_PACKAGES.items())
-    case_prices = "\n".join(f"• {case['title']} — {case['price']:,} DC".replace(",", " ") for case in CASES.values())
-    text = (
-        "💰 Экономика\n\n"
-        f"📈 +1% шанса — {EXCHANGE_CHANCE:,} DC\n"
-        f"🎁 15⭐ — {EXCHANGE_GIFT_15:,} DC\n"
-        f"🎁 25⭐ — {EXCHANGE_GIFT_25:,} DC\n"
-        f"🎁 50⭐ — {EXCHANGE_GIFT_50:,} DC\n"
-        f"🎁 100⭐ — {EXCHANGE_GIFT_100:,} DC\n"
-        f"💎 Premium — {EXCHANGE_PREMIUM_1_MONTH:,} DC\n\n"
-        f"⭐ Покупка DC:\n{packages}\n\n📦 Кейсы:\n{case_prices}"
-    ).replace(",", " ")
-    await callback.message.edit_text(text[:4000], reply_markup=admin_back_keyboard())
+    await render_admin_economy(callback)
+    await callback.answer()
+
+
+async def render_admin_exchange_prices(callback: CallbackQuery) -> None:
+    buttons = []
+    lines = ["🎁 Цены обмена", "", "➖/➕ меняют цену на указанный шаг:"]
+    for key, (label, step) in ECONOMY_PRICE_META.items():
+        value = economy_price(key)
+        lines.append(f"{label}: {value:,} DC (шаг {step:,})".replace(",", " "))
+        buttons.append([
+            InlineKeyboardButton(text="➖", callback_data=f"admin_eprice:{key}:down"),
+            InlineKeyboardButton(text=f"{value:,} DC".replace(",", " "), callback_data="admin_noop"),
+            InlineKeyboardButton(text="➕", callback_data=f"admin_eprice:{key}:up"),
+        ])
+    buttons.append([InlineKeyboardButton(text="◀️ Экономика", callback_data="admin_economy")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin_econ_exchange")
+async def admin_exchange_prices_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await render_admin_exchange_prices(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_eprice:"))
+async def admin_exchange_price_adjust_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        _, key, direction = callback.data.split(":", 2)
+        _, step = ECONOMY_PRICE_META[key]
+    except (AttributeError, KeyError, ValueError):
+        await callback.answer("❌ Настройка не найдена", show_alert=True)
+        return
+    old_value = economy_price(key)
+    new_value = max(step, old_value + (step if direction == "up" else -step))
+    if new_value == old_value:
+        await callback.answer(f"Минимальная цена: {step:,} DC".replace(",", " "), show_alert=True)
+        return
+    ECONOMY[key] = new_value
+    await db.set_setting(f"economy:{key}", new_value)
+    await render_admin_exchange_prices(callback)
+    await callback.answer(f"✅ {old_value:,} → {new_value:,} DC".replace(",", " "))
+
+
+async def render_admin_star_packages(callback: CallbackQuery) -> None:
+    buttons = []
+    lines = ["⭐ Цены покупки D-COINS", "", "➖/➕ меняют стоимость пакета на 10⭐:"]
+    for dc_amount, stars in STAR_DC_PACKAGES.items():
+        lines.append(f"{dc_amount:,} DC — {stars}⭐".replace(",", " "))
+        buttons.append([
+            InlineKeyboardButton(text="➖10⭐", callback_data=f"admin_star:{dc_amount}:down"),
+            InlineKeyboardButton(text=f"{dc_amount // 1000}K · {stars}⭐", callback_data="admin_noop"),
+            InlineKeyboardButton(text="➕10⭐", callback_data=f"admin_star:{dc_amount}:up"),
+        ])
+    buttons.append([InlineKeyboardButton(text="◀️ Экономика", callback_data="admin_economy")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin_econ_stars")
+async def admin_star_packages_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await render_admin_star_packages(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_star:"))
+async def admin_star_package_adjust_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        _, dc_text, direction = callback.data.split(":", 2)
+        dc_amount = int(dc_text)
+        old_value = STAR_DC_PACKAGES[dc_amount]
+    except (AttributeError, KeyError, ValueError):
+        await callback.answer("❌ Пакет не найден", show_alert=True)
+        return
+    new_value = max(1, old_value + (10 if direction == "up" else -10))
+    if new_value == old_value:
+        await callback.answer("Минимальная цена: 1⭐", show_alert=True)
+        return
+    STAR_DC_PACKAGES[dc_amount] = new_value
+    await db.set_setting(f"stars:{dc_amount}", new_value)
+    await render_admin_star_packages(callback)
+    await callback.answer(f"✅ {old_value}⭐ → {new_value}⭐")
+
+
+def case_prize_label(reward: tuple) -> str:
+    kind, value, _ = case_reward_parts(reward)
+    return f"🎁 {value}⭐" if kind == "gift" else f"🪙 {value:,} DC".replace(",", " ")
+
+
+def admin_case_select_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"🎲 {case['title']}", callback_data=f"admin_case:{case_id}")]
+        for case_id, case in CASES.items()
+    ]
+    buttons.append([InlineKeyboardButton(text="◀️ Экономика", callback_data="admin_economy")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "admin_econ_cases")
+async def admin_case_select_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🎲 Шансы кейсов\n\nВыбери кейс. Сумма шансов всегда останется равна 100%.",
+        reply_markup=admin_case_select_keyboard(),
+    )
+    await callback.answer()
+
+
+async def render_admin_case_chances(callback: CallbackQuery, case_id: str) -> None:
+    case = CASES[case_id]
+    lines = [f"🎲 {case['title']} — шансы", "", "Монеты меняются на 1%, подарки — на 0.05%:"]
+    buttons = []
+    for index, reward in enumerate(case["rewards"]):
+        kind, _, chance = case_reward_parts(reward)
+        label = case_prize_label(reward)
+        lines.append(f"{label}: {chance:.2f}%")
+        step_label = "0.05" if kind == "gift" else "1"
+        buttons.append([
+            InlineKeyboardButton(text=f"➖{step_label}", callback_data=f"admin_caseadj:{case_id}:{index}:down"),
+            InlineKeyboardButton(text=f"{label} · {chance:.2f}%", callback_data="admin_noop"),
+            InlineKeyboardButton(text=f"➕{step_label}", callback_data=f"admin_caseadj:{case_id}:{index}:up"),
+        ])
+    buttons.append([InlineKeyboardButton(text="◀️ Все кейсы", callback_data="admin_econ_cases")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("admin_case:"))
+async def admin_case_chances_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    case_id = callback.data.removeprefix("admin_case:")
+    if case_id not in CASES:
+        await callback.answer("❌ Кейс не найден", show_alert=True)
+        return
+    await render_admin_case_chances(callback, case_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_caseadj:"))
+async def admin_case_chance_adjust_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    try:
+        _, case_id, index_text, direction = callback.data.split(":", 3)
+        index = int(index_text)
+        rewards = CASES[case_id]["rewards"]
+        kind, _, old_chance = case_reward_parts(rewards[index])
+    except (AttributeError, KeyError, ValueError, IndexError):
+        await callback.answer("❌ Награда не найдена", show_alert=True)
+        return
+    step = 0.05 if kind == "gift" else 1.0
+    new_chance = max(0.01, min(99.0, old_chance + (step if direction == "up" else -step)))
+    if abs(new_chance - old_chance) < 0.000001:
+        await callback.answer("Достигнут предел изменения", show_alert=True)
+        return
+    other_total = sum(case_reward_parts(item)[2] for i, item in enumerate(rewards) if i != index)
+    if other_total <= 0:
+        await callback.answer("❌ Нельзя пересчитать остальные шансы", show_alert=True)
+        return
+    scale = (100.0 - new_chance) / other_total
+    for i, reward in enumerate(rewards):
+        chance = new_chance if i == index else case_reward_parts(reward)[2] * scale
+        rewards[i] = case_reward_tuple(reward, chance)
+    await save_case_chances(case_id)
+    await render_admin_case_chances(callback, case_id)
+    await callback.answer(f"✅ {old_chance:.2f}% → {new_chance:.2f}%")
+
+
+@router.callback_query(F.data == "admin_noop")
+async def admin_noop_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
     await callback.answer()
 
 @router.callback_query(F.data == "admin_commands")
@@ -3048,7 +3408,7 @@ async def cmd_exchange(message: Message) -> None:
 async def buy_dc_menu(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         "⭐ Покупка D-COINS за звёзды\n\n"
-        "Курс: 500 DC = 1⭐\n"
+        "Актуальные цены указаны на кнопках.\n"
         "Выбери пакет:",
         reply_markup=buy_dc_keyboard(),
     )
@@ -3079,7 +3439,7 @@ async def buy_dc_package(callback: CallbackQuery, bot: Bot) -> None:
             chat_id=callback.from_user.id,
             title=f"{dc_amount:,} D-COINS".replace(",", " "),
             description=f"Покупка {dc_amount:,} D-COINS за {star_amount}⭐".replace(",", " "),
-            payload=f"buy_dc_{dc_amount}",
+            payload=f"buy_dc_{dc_amount}_{star_amount}",
             currency="XTR",
             prices=[LabeledPrice(label=f"{dc_amount:,} DC".replace(",", " "), amount=star_amount)],
         )
@@ -3092,16 +3452,17 @@ async def buy_dc_package(callback: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data == "exch_chance")
 async def exch_chance(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
+    cost = economy_price("chance_price")
     if await db.is_banned(user_id):
         await callback.answer(BAN_MESSAGE, show_alert=True)
         return
     balance, _ = await db.get_coins(user_id)
-    if balance < EXCHANGE_CHANCE:
-        await callback.answer(f"❌ Нужно {EXCHANGE_CHANCE} DC, у тебя {balance}", show_alert=True)
+    if balance < cost:
+        await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
         return
-    if not await db.remove_coins(user_id, EXCHANGE_CHANCE):
+    if not await db.remove_coins(user_id, cost):
         balance, _ = await db.get_coins(user_id)
-        await callback.answer(f"❌ Нужно {EXCHANGE_CHANCE} DC, у тебя {balance}", show_alert=True)
+        await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
         return
     chance, msg_count, last_bonus = await db.get_user(user_id, MAIN_CHAT_ID)
     new_chance = min(round(chance + 1.0, 3), MAX_CHANCE)
@@ -3109,7 +3470,7 @@ async def exch_chance(callback: CallbackQuery) -> None:
     await db.update_user(user_id, MAIN_CHAT_ID, name, new_chance, msg_count, last_bonus)
     new_balance, _ = await db.get_coins(user_id)
     await callback.message.edit_text(
-        f"✅ Обменял {EXCHANGE_CHANCE} DC на +1% шанса\n"
+        f"✅ Обменял {cost} DC на +1% шанса\n"
         f"🪙 Баланс: {new_balance} DC\n"
         f"📈 Новый шанс: {new_chance:.3f}%",
         reply_markup=exchange_keyboard(new_balance)
@@ -3201,39 +3562,40 @@ async def process_exchange_gift(callback: CallbackQuery, cost: int, gift_key: in
 
 @router.callback_query(F.data == "exch_gift_15")
 async def exch_gift_15(callback: CallbackQuery, bot: Bot) -> None:
-    await process_exchange_gift(callback, EXCHANGE_GIFT_15, 5, "15⭐", bot)
+    await process_exchange_gift(callback, economy_price("gift_15"), 5, "15⭐", bot)
 
 @router.callback_query(F.data == "exch_gift_25")
 async def exch_gift_25(callback: CallbackQuery, bot: Bot) -> None:
-    await process_exchange_gift(callback, EXCHANGE_GIFT_25, 10, "25⭐", bot)
+    await process_exchange_gift(callback, economy_price("gift_25"), 10, "25⭐", bot)
 
 @router.callback_query(F.data == "exch_gift_50")
 async def exch_gift_50(callback: CallbackQuery, bot: Bot) -> None:
-    await process_exchange_gift(callback, EXCHANGE_GIFT_50, 15, "50⭐", bot)
+    await process_exchange_gift(callback, economy_price("gift_50"), 15, "50⭐", bot)
 
 @router.callback_query(F.data == "exch_gift_100")
 async def exch_gift_100(callback: CallbackQuery, bot: Bot) -> None:
-    await process_exchange_gift(callback, EXCHANGE_GIFT_100, 20, "100⭐", bot)
+    await process_exchange_gift(callback, economy_price("gift_100"), 20, "100⭐", bot)
 
 @router.callback_query(F.data == "exch_premium_1m")
 async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
+    cost = economy_price("premium_1m")
     if await db.is_banned(user_id):
         await callback.answer(BAN_MESSAGE, show_alert=True)
         return
-    if not await db.remove_coins(user_id, EXCHANGE_PREMIUM_1_MONTH):
+    if not await db.remove_coins(user_id, cost):
         balance, _ = await db.get_coins(user_id)
         await callback.answer(
-            f"❌ Нужно {EXCHANGE_PREMIUM_1_MONTH:,} DC, у тебя {balance:,}".replace(",", " "),
+            f"❌ Нужно {cost:,} DC, у тебя {balance:,}".replace(",", " "),
             show_alert=True,
         )
         return
 
     name = await db.get_user_name(user_id)
     try:
-        order_id = await db.add_premium_order(user_id, name, EXCHANGE_PREMIUM_1_MONTH)
+        order_id = await db.add_premium_order(user_id, name, cost)
     except Exception:
-        await db.add_coins(user_id, EXCHANGE_PREMIUM_1_MONTH)
+        await db.add_coins(user_id, cost)
         logger.exception("Could not create Premium order")
         await callback.answer("❌ Не удалось создать заявку. DC возвращены.", show_alert=True)
         return
@@ -3241,7 +3603,7 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
     new_balance, _ = await db.get_coins(user_id)
     await callback.message.edit_text(
         f"✅ Заявка #{order_id} на Premium на месяц создана\n"
-        f"🪙 Списано: {EXCHANGE_PREMIUM_1_MONTH:,} DC\n"
+        f"🪙 Списано: {cost:,} DC\n"
         f"🪙 Баланс: {new_balance:,} DC\n\n"
         "💎 Premium будет выдан вручную в ближайшее время.".replace(",", " "),
         reply_markup=exchange_keyboard(new_balance),
@@ -3251,10 +3613,10 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
             ADMIN_ID,
             f"💎 Новая заявка Premium на месяц\n\n"
             f"#{order_id} | {name} ({user_id})\n"
-            f"🪙 {EXCHANGE_PREMIUM_1_MONTH:,} DC\n\n"
+            f"🪙 {cost:,} DC\n\n"
             f"После выдачи: premiumdone {order_id}".replace(",", " "),
         )
-        await send_log(bot, f"💎 Обмен на Premium\n\n#{order_id} | {name} ({user_id})\n{EXCHANGE_PREMIUM_1_MONTH:,} DC".replace(",", " "))
+        await send_log(bot, f"💎 Обмен на Premium\n\n#{order_id} | {name} ({user_id})\n{cost:,} DC".replace(",", " "))
     except Exception as e:
         logger.warning("Could not notify about Premium order: %s", e)
     await callback.answer("✅ Заявка создана")
@@ -3487,6 +3849,7 @@ async def main() -> None:
     if not TOKEN:
         raise ValueError("BOT_TOKEN не задан в .env")
     await db.init()
+    await load_runtime_settings()
     bot = Bot(token=TOKEN)
     dp  = Dispatcher()
     dp.include_router(router)
