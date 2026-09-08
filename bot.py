@@ -937,7 +937,7 @@ async def send_game_log(bot: Bot, text: str) -> None:
 
 async def publish_promo(bot: Bot, text: str) -> bool:
     try:
-        await bot.send_message(PROMO_CHANNEL_ID, text)
+        await bot.send_message(PROMO_CHANNEL_ID, text, parse_mode="HTML")
         return True
     except Exception as e:
         logger.warning("publish_promo failed: %s", e)
