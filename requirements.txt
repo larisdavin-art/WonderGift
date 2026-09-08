@@ -1,0 +1,5 @@
+aiogram
+aiosqlite
+pytz
+cachetools
+python-dotenv
