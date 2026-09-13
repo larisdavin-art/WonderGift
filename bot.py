@@ -61,6 +61,12 @@ CASINO_TIMEOUT     = 300  # 5 минут
 CASINO_BET_COOLDOWN = 10  # секунд между ставками одного пользователя
 CASE_OPEN_COOLDOWN = 5    # секунд между открытиями кейса
 
+# Дуэли в основном чате
+DUEL_MIN_BET       = 5
+DUEL_MAX_BET       = 100_000
+DUEL_COOLDOWN      = 10
+DUEL_TIMEOUT       = 300
+
 # Обмен
 EXCHANGE_CHANCE    = 5000   # 5 000 DC = +1% шанса
 EXCHANGE_GIFT_15   = 40000
@@ -153,6 +159,9 @@ WIN_GIFT_IDS = [
 
 # Активные игры казино: user_id -> {"game": str, "bet": int, "data": dict, "expires": float}
 active_games: dict = {}
+# Активные дуэли: duel_id -> данные дуэли; пользователь может находиться только в одной.
+active_duels: dict[str, dict] = {}
+duel_by_user: dict[int, str] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -792,6 +801,48 @@ class Database:
                 await db.rollback()
                 raise
 
+    async def settle_duel(
+        self, challenger_id: int, opponent_id: int, bet: int, winner_id: int
+    ) -> tuple[bool, int, int]:
+        """Атомарно списывает две ставки и переводит весь банк победителю."""
+        if challenger_id == opponent_id or bet < DUEL_MIN_BET or bet > DUEL_MAX_BET:
+            return False, 0, 0
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO coins (user_id, balance) VALUES (?, ?)",
+                    [(challenger_id, COINS_START), (opponent_id, COINS_START)],
+                )
+                async with db.execute(
+                    "SELECT user_id, balance FROM coins WHERE user_id IN (?, ?)",
+                    (challenger_id, opponent_id),
+                ) as cur:
+                    balances = {user_id: balance for user_id, balance in await cur.fetchall()}
+                challenger_balance = balances.get(challenger_id, COINS_START)
+                opponent_balance = balances.get(opponent_id, COINS_START)
+                if challenger_balance < bet or opponent_balance < bet:
+                    await db.rollback()
+                    return False, challenger_balance, opponent_balance
+                await db.execute(
+                    "UPDATE coins SET balance = balance - ? WHERE user_id IN (?, ?)",
+                    (bet, challenger_id, opponent_id),
+                )
+                await db.execute(
+                    "UPDATE coins SET balance = balance + ? WHERE user_id=?",
+                    (bet * 2, winner_id),
+                )
+                async with db.execute(
+                    "SELECT user_id, balance FROM coins WHERE user_id IN (?, ?)",
+                    (challenger_id, opponent_id),
+                ) as cur:
+                    final_balances = {user_id: balance for user_id, balance in await cur.fetchall()}
+                await db.commit()
+                return True, final_balances[challenger_id], final_balances[opponent_id]
+            except Exception:
+                await db.rollback()
+                raise
+
     async def set_coin_bonus_time(self, user_id: int) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("""
@@ -1124,6 +1175,43 @@ async def casino_timeout_checker(bot: Bot) -> None:
                 pass
 
 
+def release_duel(duel_id: str) -> dict | None:
+    duel = active_duels.pop(duel_id, None)
+    if not duel:
+        return None
+    for user_id in (duel["challenger_id"], duel.get("opponent_id")):
+        if user_id is not None and duel_by_user.get(user_id) == duel_id:
+            duel_by_user.pop(user_id, None)
+    return duel
+
+
+async def duel_timeout_checker(bot: Bot) -> None:
+    while True:
+        await asyncio.sleep(5)
+        now = time.time()
+        expired_ids = [
+            duel_id for duel_id, duel in active_duels.items()
+            if duel.get("status") == "open" and duel["expires"] <= now
+        ]
+        for duel_id in expired_ids:
+            duel = release_duel(duel_id)
+            if not duel:
+                continue
+            try:
+                await bot.edit_message_text(
+                    chat_id=duel["chat_id"],
+                    message_id=duel["message_id"],
+                    text=(
+                        "⌛ Дуэль отменена\n\n"
+                        f"Игрок: {duel['challenger_name']}\n"
+                        f"Ставка: {duel['bet']:,} DC\n"
+                        "Никто не принял вызов за 5 минут."
+                    ).replace(",", " "),
+                )
+            except Exception as e:
+                logger.warning("Could not expire duel %s: %s", duel_id, e)
+
+
 # =========================
 # ROUTER
 # =========================
@@ -1132,6 +1220,7 @@ router    = Router()
 cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=COOLDOWN_SECONDS)
 casino_bet_cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=CASINO_BET_COOLDOWN)
 case_open_cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=CASE_OPEN_COOLDOWN)
+duel_cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=DUEL_COOLDOWN)
 
 PLAIN_COMMANDS = {
     "start", "help", "ref", "refstats", "say", "vip", "unvip", "viplist",
@@ -1141,7 +1230,7 @@ PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "reftop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
-    "roulette", "dice", "mines", "exchange", "admin",
+    "roulette", "dice", "mines", "duel", "exchange", "admin",
 }
 
 RUSSIAN_COMMANDS = {
@@ -1154,7 +1243,7 @@ RUSSIAN_COMMANDS = {
     "промо": "promo", "перевод": "transfer", "слоты": "slots",
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
     "удалитьзаявку": "deletepending",
-    "админ": "admin", "админка": "admin",
+    "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
 }
 
 def parse_plain_command(text: str | None):
@@ -1289,14 +1378,15 @@ async def send_help(message: Message) -> None:
         "1️⃣ Подпишись на канал и нажми «Проверить подписку».\n"
         "2️⃣ Пиши сообщения в основной группе — за них начисляются DC.\n"
         "3️⃣ Забирай ежедневный бонус: бонус.\n\n"
-        "📦 Кейсы\n"
-        "Напиши кейсы, выбери кейс кнопкой и открой его за DC или ключ.\n\n"
         "🎰 Игры — только в личке с ботом\n"
         "• слоты 50\n"
         "• рулетка красное 50\n"
         "• кубик 3 50\n"
         "• мины 2500\n"
         "В минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n"
+        "⚔️ Дуэли — только в основном чате\n"
+        "• дуэль 1000 — создать вызов на 1 000 DC\n"
+        "Соперник принимает дуэль кнопкой, победитель получает весь банк.\n\n"
         "💱 Полезное\n"
         "• баланс — твои DC\n"
         "• обмен — обмен DC на шанс, подарки или Premium\n"
@@ -3621,6 +3711,186 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
         logger.warning("Could not notify about Premium order: %s", e)
     await callback.answer("✅ Заявка создана")
 
+
+# =========================
+# GROUP — DUELS
+# =========================
+
+def duel_keyboard(duel_id: str, bet: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"⚔️ Принять за {bet:,} DC".replace(",", " "),
+            callback_data=f"duel_accept:{duel_id}",
+        )],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"duel_cancel:{duel_id}")],
+    ])
+
+
+@router.message(Command("duel"))
+async def cmd_duel(message: Message) -> None:
+    if message.chat.id != MAIN_CHAT_ID or message.chat.type not in {"group", "supergroup"}:
+        return
+    if not message.from_user or message.from_user.is_bot or message.sender_chat:
+        await message.reply("❌ Дуэль нельзя создать от имени канала.")
+        return
+    user_id = message.from_user.id
+    if await db.is_banned(user_id):
+        await message.reply(BAN_MESSAGE)
+        return
+    args = (message.text or "").split()
+    if len(args) != 2:
+        await message.reply(f"Использование: дуэль СТАВКА\nМинимум {DUEL_MIN_BET} DC, максимум {DUEL_MAX_BET:,} DC".replace(",", " "))
+        return
+    try:
+        bet = int(args[1].replace(" ", ""))
+    except ValueError:
+        await message.reply("❌ Ставка должна быть целым числом.")
+        return
+    if bet < DUEL_MIN_BET or bet > DUEL_MAX_BET:
+        await message.reply(f"❌ Ставка должна быть от {DUEL_MIN_BET} до {DUEL_MAX_BET:,} DC.".replace(",", " "))
+        return
+    if user_id in duel_by_user:
+        await message.reply("⚔️ У тебя уже есть активная дуэль.")
+        return
+    if user_id in duel_cooldowns:
+        await message.reply(f"⏳ Дуэль доступна раз в {DUEL_COOLDOWN} секунд.")
+        return
+    balance, _ = await db.get_coins(user_id)
+    if balance < bet:
+        await message.reply(f"❌ Для дуэли нужно {bet:,} DC, у тебя {balance:,} DC.".replace(",", " "))
+        return
+
+    duel_id = f"{user_id:x}{random.getrandbits(32):08x}"
+    while duel_id in active_duels:
+        duel_id = f"{user_id:x}{random.getrandbits(32):08x}"
+    challenger_name = display_name(message.from_user)
+    sent = await message.reply(
+        (
+            "⚔️ Вызов на дуэль!\n\n"
+            f"Игрок: {challenger_name}\n"
+            f"Ставка каждого: {bet:,} DC\n"
+            f"Банк победителя: {bet * 2:,} DC\n"
+            "Шанс победы: 50/50\n\n"
+            "Кто примет вызов?"
+        ).replace(",", " "),
+        reply_markup=duel_keyboard(duel_id, bet),
+    )
+    active_duels[duel_id] = {
+        "challenger_id": user_id,
+        "challenger_name": challenger_name,
+        "opponent_id": None,
+        "bet": bet,
+        "chat_id": message.chat.id,
+        "message_id": sent.message_id,
+        "expires": time.time() + DUEL_TIMEOUT,
+        "status": "open",
+    }
+    duel_by_user[user_id] = duel_id
+    duel_cooldowns[user_id] = True
+
+
+@router.callback_query(F.data.startswith("duel_cancel:"))
+async def duel_cancel_callback(callback: CallbackQuery) -> None:
+    duel_id = callback.data.removeprefix("duel_cancel:")
+    duel = active_duels.get(duel_id)
+    if not duel or duel.get("status") != "open":
+        await callback.answer("Дуэль уже закрыта.", show_alert=True)
+        return
+    if callback.from_user.id != duel["challenger_id"]:
+        await callback.answer("Отменить дуэль может только её автор.", show_alert=True)
+        return
+    release_duel(duel_id)
+    await callback.message.edit_text(
+        f"❌ {duel['challenger_name']} отменил дуэль на {duel['bet']:,} DC.".replace(",", " ")
+    )
+    await callback.answer("Дуэль отменена")
+
+
+@router.callback_query(F.data.startswith("duel_accept:"))
+async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
+    duel_id = callback.data.removeprefix("duel_accept:")
+    duel = active_duels.get(duel_id)
+    if not duel or duel.get("status") != "open":
+        await callback.answer("Дуэль уже принята или закрыта.", show_alert=True)
+        return
+    opponent_id = callback.from_user.id
+    challenger_id = duel["challenger_id"]
+    if opponent_id == challenger_id:
+        await callback.answer("Нельзя принять собственную дуэль.", show_alert=True)
+        return
+    if opponent_id in duel_by_user:
+        await callback.answer("У тебя уже есть активная дуэль.", show_alert=True)
+        return
+    if opponent_id in duel_cooldowns:
+        await callback.answer(f"Следующая дуэль доступна через {DUEL_COOLDOWN} секунд.", show_alert=True)
+        return
+    if await db.is_banned(opponent_id) or await db.is_banned(challenger_id):
+        release_duel(duel_id)
+        await callback.message.edit_text("🚫 Дуэль отменена: один из участников заблокирован.")
+        await callback.answer("Дуэль отменена", show_alert=True)
+        return
+
+    duel["status"] = "processing"
+    duel["opponent_id"] = opponent_id
+    duel_by_user[opponent_id] = duel_id
+    opponent_name = display_name(callback.from_user)
+    winner_id = random.choice((challenger_id, opponent_id))
+    bet = duel["bet"]
+    try:
+        settled, challenger_balance, opponent_balance = await db.settle_duel(
+            challenger_id, opponent_id, bet, winner_id
+        )
+    except Exception as e:
+        logger.exception("Duel settlement failed: %s", e)
+        duel["status"] = "open"
+        duel["opponent_id"] = None
+        duel_by_user.pop(opponent_id, None)
+        await callback.answer("❌ Ошибка проведения дуэли. Попробуй ещё раз.", show_alert=True)
+        return
+
+    if not settled:
+        duel["status"] = "open"
+        duel["opponent_id"] = None
+        duel_by_user.pop(opponent_id, None)
+        if challenger_balance < bet:
+            release_duel(duel_id)
+            await callback.message.edit_text(
+                f"❌ Дуэль отменена: у {duel['challenger_name']} больше нет {bet:,} DC.".replace(",", " ")
+            )
+            await callback.answer("У автора недостаточно DC", show_alert=True)
+        else:
+            await callback.answer(f"❌ Для принятия нужно {bet:,} DC, у тебя {opponent_balance:,} DC.".replace(",", " "), show_alert=True)
+        return
+
+    duel_cooldowns[challenger_id] = True
+    duel_cooldowns[opponent_id] = True
+    release_duel(duel_id)
+    winner_name = duel["challenger_name"] if winner_id == challenger_id else opponent_name
+    loser_name = opponent_name if winner_id == challenger_id else duel["challenger_name"]
+    winner_balance = challenger_balance if winner_id == challenger_id else opponent_balance
+    await callback.message.edit_text(
+        (
+            "⚔️ Дуэль завершена!\n\n"
+            f"{duel['challenger_name']} VS {opponent_name}\n"
+            f"Ставка каждого: {bet:,} DC\n"
+            f"🏆 Победитель: {winner_name}\n"
+            f"💰 Выигрыш: {bet * 2:,} DC\n"
+            f"🪙 Баланс победителя: {winner_balance:,} DC\n\n"
+            f"{loser_name} проиграл ставку."
+        ).replace(",", " ")
+    )
+    await send_game_log(
+        bot,
+        (
+            "⚔️ Дуэль\n"
+            f"{duel['challenger_name']} ({challenger_id}) VS {opponent_name} ({opponent_id})\n"
+            f"💸 Ставка: {bet:,} DC с каждого\n"
+            f"🏆 Победитель: {winner_name} ({winner_id})\n"
+            f"💰 Банк: {bet * 2:,} DC"
+        ).replace(",", " "),
+    )
+    await callback.answer(f"🏆 Победил {winner_name}!")
+
 # =========================
 # NEW MEMBERS
 # =========================
@@ -3670,7 +3940,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "promo", "cases", "slots", "roulette", "dice", "mines", "admin",
 }
-GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "reftop", "cointop", "daytop", "bonus"}
+GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "reftop", "cointop", "daytop", "bonus", "duel"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "ref", "say", "addrefs", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
@@ -3695,7 +3965,7 @@ PLAIN_COMMAND_HANDLERS = {
     "promo": cmd_promo, "transfer": cmd_transfer, "daytop": cmd_daytop,
     "bonus": cmd_bonus, "cases": cmd_cases, "slots": cmd_slots,
     "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines,
-    "exchange": cmd_exchange, "admin": cmd_admin,
+    "duel": cmd_duel, "exchange": cmd_exchange, "admin": cmd_admin,
 }
 
 @router.message(is_plain_command)
@@ -3855,6 +4125,7 @@ async def main() -> None:
     dp.include_router(router)
     asyncio.create_task(daily_reset_task(bot))
     asyncio.create_task(casino_timeout_checker(bot))
+    asyncio.create_task(duel_timeout_checker(bot))
     logger.info("Бот запущен")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
