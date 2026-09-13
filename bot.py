@@ -1386,6 +1386,8 @@ async def send_help(message: Message) -> None:
         "В минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n"
         "⚔️ Дуэли — только в основном чате\n"
         "• дуэль 1000 — создать вызов на 1 000 DC\n"
+        "• дуэль 1000 @username — вызвать конкретного игрока\n"
+        "Также можно ответить «дуэль 1000» на сообщение соперника.\n"
         "Соперник принимает дуэль кнопкой, победитель получает весь банк.\n\n"
         "💱 Полезное\n"
         "• баланс — твои DC\n"
@@ -3738,8 +3740,15 @@ async def cmd_duel(message: Message) -> None:
         await message.reply(BAN_MESSAGE)
         return
     args = (message.text or "").split()
-    if len(args) != 2:
-        await message.reply(f"Использование: дуэль СТАВКА\nМинимум {DUEL_MIN_BET} DC, максимум {DUEL_MAX_BET:,} DC".replace(",", " "))
+    if len(args) not in {2, 3}:
+        await message.reply(
+            (
+                "Использование: дуэль СТАВКА\n"
+                "Или: дуэль СТАВКА @username\n"
+                "Также можно ответить этой командой на сообщение игрока.\n"
+                f"Минимум {DUEL_MIN_BET} DC, максимум {DUEL_MAX_BET:,} DC"
+            ).replace(",", " ")
+        )
         return
     try:
         bet = int(args[1].replace(" ", ""))
@@ -3760,10 +3769,44 @@ async def cmd_duel(message: Message) -> None:
         await message.reply(f"❌ Для дуэли нужно {bet:,} DC, у тебя {balance:,} DC.".replace(",", " "))
         return
 
+    target_id = None
+    target_name = None
+    reply = message.reply_to_message
+    if reply and reply.from_user and not reply.from_user.is_bot and not reply.sender_chat:
+        if len(args) == 3:
+            await message.reply("❌ Выбери один способ: ответ на сообщение или @username.")
+            return
+        target_id = reply.from_user.id
+        target_name = display_name(reply.from_user)
+    elif reply and len(args) == 2:
+        await message.reply("❌ Нельзя вызвать на дуэль канал или бота.")
+        return
+    elif len(args) == 3:
+        target_username = args[2]
+        if not target_username.startswith("@"):
+            await message.reply("❌ Укажи игрока через @username или ответь на его сообщение.")
+            return
+        target = await db.find_user_by_username(target_username)
+        if not target:
+            await message.reply("❌ Игрок не найден. Пусть он сначала напишет сообщение в основной чат или вызови его ответом на сообщение.")
+            return
+        target_id, target_name = target
+
+    if target_id == user_id:
+        await message.reply("❌ Нельзя вызвать на дуэль самого себя.")
+        return
+    if target_id and target_id in duel_by_user:
+        await message.reply("⚔️ У этого игрока уже есть активная дуэль.")
+        return
+
     duel_id = f"{user_id:x}{random.getrandbits(32):08x}"
     while duel_id in active_duels:
         duel_id = f"{user_id:x}{random.getrandbits(32):08x}"
     challenger_name = display_name(message.from_user)
+    target_text = (
+        f"Вызов для: {target_name}\nТолько этот игрок может принять дуэль."
+        if target_id else "Кто примет вызов?"
+    )
     sent = await message.reply(
         (
             "⚔️ Вызов на дуэль!\n\n"
@@ -3771,7 +3814,7 @@ async def cmd_duel(message: Message) -> None:
             f"Ставка каждого: {bet:,} DC\n"
             f"Банк победителя: {bet * 2:,} DC\n"
             "Шанс победы: 50/50\n\n"
-            "Кто примет вызов?"
+            f"{target_text}"
         ).replace(",", " "),
         reply_markup=duel_keyboard(duel_id, bet),
     )
@@ -3779,6 +3822,8 @@ async def cmd_duel(message: Message) -> None:
         "challenger_id": user_id,
         "challenger_name": challenger_name,
         "opponent_id": None,
+        "target_id": target_id,
+        "target_name": target_name,
         "bet": bet,
         "chat_id": message.chat.id,
         "message_id": sent.message_id,
@@ -3817,6 +3862,13 @@ async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
     challenger_id = duel["challenger_id"]
     if opponent_id == challenger_id:
         await callback.answer("Нельзя принять собственную дуэль.", show_alert=True)
+        return
+    target_id = duel.get("target_id")
+    if target_id is not None and opponent_id != target_id:
+        await callback.answer(
+            f"Эта дуэль предназначена для {duel.get('target_name') or 'другого игрока'}.",
+            show_alert=True,
+        )
         return
     if opponent_id in duel_by_user:
         await callback.answer("У тебя уже есть активная дуэль.", show_alert=True)
