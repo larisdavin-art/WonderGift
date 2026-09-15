@@ -10,14 +10,14 @@ import pytz
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message,
-    ChatMemberUpdated,
     LabeledPrice,
     PreCheckoutQuery,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton
 )
-from aiogram.filters import Command, ChatMemberUpdatedFilter, JOIN_TRANSITION
+from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from cachetools import TTLCache
 from dotenv import load_dotenv
 import os
@@ -44,8 +44,6 @@ START_CHANCE       = 0.1
 STEP               = 0.002
 MAX_CHANCE         = 100.0
 BONUS_COOLDOWN     = 43200
-REF_BONUS          = 1.0
-VALID_REF_MESSAGES = 10
 
 # D-COINS
 COINS_START        = 10
@@ -80,14 +78,6 @@ STAR_DC_PACKAGES = {amount: (amount // 100_000) * 200 for amount in range(100_00
 
 # Кейсы
 CASES = {
-    "karapuz": {
-        "title": "KARAPUZ",
-        "price": 1000,
-        "rewards": [
-            (100, 5), (150, 7), (300, 12), (500, 15), (600, 16),
-            (700, 15), (800, 12), (900, 8), (1000, 5), (1500, 3), (3000, 2),
-        ],
-    },
     "blood": {
         "title": "BLOOD",
         "price": 5000,
@@ -118,6 +108,42 @@ CASES = {
             ("gift", 15, 0.6), ("gift", 25, 0.15), ("gift", 50, 0.05),
         ],
     },
+    "school": {
+        "title": "ШКОЛЬНЫЙ",
+        "price": 3000,
+        "rewards": [
+            ("coins", 250, 22.3), ("coins", 500, 25.25),
+            ("coins", 1000, 24), ("coins", 1500, 15),
+            ("coins", 2500, 8), ("coins", 4000, 3.5),
+            ("coins", 7000, 1.7), ("gift", 15, 0.2),
+            ("gift", 25, 0.04), ("gift", 50, 0.01),
+        ],
+    },
+    "student": {
+        "title": "СТУДЕНЧЕСКИЙ",
+        "price": 12000,
+        "rewards": [
+            ("coins", 1000, 22.4), ("coins", 3000, 22.3),
+            ("coins", 5000, 20), ("coins", 7500, 15),
+            ("coins", 10000, 10), ("coins", 15000, 6),
+            ("coins", 25000, 2.5), ("coins", 40000, 1.4),
+            ("gift", 15, 0.3), ("gift", 25, 0.07),
+            ("gift", 50, 0.02), ("gift", 100, 0.01),
+        ],
+    },
+    "excellent": {
+        "title": "КЕЙС ОТЛИЧНИКА",
+        "price": None,
+        "key_only": True,
+        "rewards": [
+            ("coins", 3000, 18), ("coins", 8000, 20),
+            ("coins", 12000, 20), ("coins", 20000, 15),
+            ("coins", 30000, 10), ("coins", 45000, 7),
+            ("coins", 70000, 4), ("coins", 100000, 2),
+            ("gift", 15, 2), ("gift", 25, 1),
+            ("gift", 50, 0.6), ("gift", 100, 0.4),
+        ],
+    },
 }
 
 # Изменяемые настройки экономики. Значения загружаются из SQLite при старте,
@@ -136,14 +162,8 @@ BAN_MESSAGE = "🚫 Вы заблокированы и не можете уча�
 
 POPOLNIT_AMOUNT = 50
 
-REF_REWARDS = {
-    5:  "15⭐",
-    10: "25⭐",
-    15: "50⭐",
-    20: "100⭐",
-}
-
-REF_GIFT_IDS = {
+# Наборы ID Telegram-подарков для кейсов и обменов.
+GIFT_IDS = {
     5:  ["5170145012310081615", "5170233102089322756"],
     10: ["5170250947678437525", "5168103777563050263"],
     15: ["5170144170496491616", "5170314324215857265",
@@ -194,20 +214,10 @@ class Database:
             if "username" not in columns:
                 await db.execute("ALTER TABLE user_stats ADD COLUMN username TEXT")
 
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS referrals (
-                    invited_user_id INTEGER PRIMARY KEY,
-                    inviter_user_id INTEGER NOT NULL,
-                    valid           INTEGER DEFAULT 0,
-                    msg_count       INTEGER DEFAULT 0
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS invite_links (
-                    user_id     INTEGER PRIMARY KEY,
-                    invite_link TEXT    NOT NULL UNIQUE
-                )
-            """)
+            # Реферальная программа отключена: удаляем её устаревшие данные
+            # при первом запуске обновлённой версии.
+            await db.execute("DROP TABLE IF EXISTS referrals")
+            await db.execute("DROP TABLE IF EXISTS invite_links")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS wins (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +328,14 @@ class Database:
                 await db.execute("ALTER TABLE promo_codes ADD COLUMN case_id TEXT")
             if "case_count" not in promo_columns:
                 await db.execute("ALTER TABLE promo_codes ADD COLUMN case_count INTEGER")
+            # Удалённый кейс KARAPUZ больше нельзя открыть или получить по промокоду.
+            await db.execute(
+                "DELETE FROM promo_activations WHERE code IN "
+                "(SELECT code FROM promo_codes WHERE case_id='karapuz')"
+            )
+            await db.execute("DELETE FROM promo_codes WHERE case_id='karapuz'")
+            await db.execute("DELETE FROM case_keys WHERE case_id='karapuz'")
+            await db.execute("DELETE FROM app_settings WHERE key LIKE 'case_chance:karapuz:%'")
             await db.commit()
 
     # --------------------------------------------------
@@ -561,83 +579,6 @@ class Database:
                 return await cur.fetchall()
 
     # --------------------------------------------------
-    # INVITE LINKS
-    # --------------------------------------------------
-
-    async def get_invite_link(self, user_id: int):
-        async with aiosqlite.connect(self.path) as db:
-            async with db.execute(
-                "SELECT invite_link FROM invite_links WHERE user_id=?", (user_id,)
-            ) as cur:
-                row = await cur.fetchone()
-        return row[0] if row else None
-
-    async def save_invite_link(self, user_id: int, invite_link: str) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO invite_links (user_id, invite_link) VALUES (?, ?)",
-                (user_id, invite_link)
-            )
-            await db.commit()
-
-    async def get_owner_by_link(self, invite_link: str):
-        async with aiosqlite.connect(self.path) as db:
-            async with db.execute(
-                "SELECT user_id FROM invite_links WHERE invite_link=?", (invite_link,)
-            ) as cur:
-                row = await cur.fetchone()
-        return row[0] if row else None
-
-    # --------------------------------------------------
-    # REFERRALS
-    # --------------------------------------------------
-
-    async def add_referral(self, invited_user_id: int, inviter_user_id: int) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO referrals (invited_user_id, inviter_user_id) VALUES (?, ?)",
-                (invited_user_id, inviter_user_id)
-            )
-            await db.commit()
-
-    async def get_referral(self, invited_user_id: int):
-        async with aiosqlite.connect(self.path) as db:
-            async with db.execute(
-                "SELECT inviter_user_id, valid, msg_count FROM referrals WHERE invited_user_id=?",
-                (invited_user_id,)
-            ) as cur:
-                return await cur.fetchone()
-
-    async def increment_ref_messages(self, invited_user_id: int) -> int:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "UPDATE referrals SET msg_count = msg_count + 1 WHERE invited_user_id=? AND valid=0",
-                (invited_user_id,)
-            )
-            await db.commit()
-            async with db.execute(
-                "SELECT msg_count FROM referrals WHERE invited_user_id=?", (invited_user_id,)
-            ) as cur:
-                row = await cur.fetchone()
-        return row[0] if row else 0
-
-    async def validate_referral(self, invited_user_id: int) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("UPDATE referrals SET valid=1 WHERE invited_user_id=?", (invited_user_id,))
-            await db.commit()
-
-    async def count_valid_refs(self, inviter_user_id: int) -> int:
-        async with aiosqlite.connect(self.path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM referrals WHERE inviter_user_id=? AND valid=1", (inviter_user_id,)
-            ) as cur:
-                row = await cur.fetchone()
-        return row[0] if row else 0
-
-    async def is_already_referred(self, invited_user_id: int) -> bool:
-        return (await self.get_referral(invited_user_id)) is not None
-
-    # --------------------------------------------------
     # WINS
     # --------------------------------------------------
 
@@ -662,24 +603,6 @@ class Database:
             async with db.execute(
                 "SELECT user_name, COUNT(*) as cnt FROM wins WHERE chat_id=? GROUP BY user_id ORDER BY cnt DESC LIMIT ?",
                 (chat_id, limit)
-            ) as cur:
-                return await cur.fetchall()
-
-    # --------------------------------------------------
-    # REF TOP
-    # --------------------------------------------------
-
-    async def get_refs_top(self, limit: int = 10) -> list:
-        async with aiosqlite.connect(self.path) as db:
-            async with db.execute(
-                "SELECT r.inviter_user_id, "
-                "COALESCE(u.user_name, CAST(r.inviter_user_id AS TEXT)), "
-                "COUNT(*) as cnt "
-                "FROM referrals r "
-                "LEFT JOIN user_stats u ON u.user_id = r.inviter_user_id AND u.chat_id = ? "
-                "WHERE r.valid = 1 "
-                "GROUP BY r.inviter_user_id ORDER BY cnt DESC LIMIT ?",
-                (MAIN_CHAT_ID, limit)
             ) as cur:
                 return await cur.fetchall()
 
@@ -916,7 +839,7 @@ class Database:
                 row = await cur.fetchone()
         return row[0] if row else 0
 
-    async def open_case(self, user_id: int, case_id: str, price: int) -> str:
+    async def open_case(self, user_id: int, case_id: str, price: int | None, key_only: bool = False) -> str:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
@@ -928,6 +851,10 @@ class Database:
                 if cursor.rowcount == 1:
                     await db.commit()
                     return "key"
+
+                if key_only:
+                    await db.rollback()
+                    return "key_required"
 
                 await db.execute(
                     "INSERT OR IGNORE INTO coins (user_id, balance) VALUES (?, ?)",
@@ -1076,65 +1003,6 @@ async def publish_promo(bot: Bot, text: str) -> bool:
         return False
 
 
-async def reward_inviter(bot: Bot, inviter_id: int) -> None:
-    inv_chance, inv_msgs, inv_bonus = await db.get_user(inviter_id, MAIN_CHAT_ID)
-    new_chance = min(inv_chance + REF_BONUS, MAX_CHANCE)
-    inv_name   = await db.get_user_name(inviter_id)
-    await db.update_user(inviter_id, MAIN_CHAT_ID, inv_name, new_chance, inv_msgs, inv_bonus)
-    valid_refs = await db.count_valid_refs(inviter_id)
-    await send_log(bot,
-        f"✅ Валидный реферал\n\n"
-        f"👤 Пригласил: {inv_name} ({inviter_id})\n"
-        f"👥 Всего валидных: {valid_refs}\n"
-        f"📈 Новый шанс: {new_chance:.3f}%"
-    )
-    try:
-        await bot.send_message(inviter_id,
-            f"🎉 Твой реферал стал активным!\n"
-            f"+{REF_BONUS}% к шансу\n"
-            f"📈 Твой шанс: {new_chance:.3f}%"
-        )
-    except Exception as e:
-        logger.warning("Notify inviter %s failed: %s", inviter_id, e)
-
-    if valid_refs in REF_REWARDS:
-        reward   = REF_REWARDS[valid_refs]
-        gift_ids = REF_GIFT_IDS.get(valid_refs, [])
-        gift_id  = random.choice(gift_ids) if gift_ids else None
-        await send_log(bot,
-            f"🎁 Реферальная награда\n\n"
-            f"👤 {inv_name} ({inviter_id})\n"
-            f"🏆 Награда: {reward}\n"
-            f"👥 Рефералов: {valid_refs}"
-        )
-        await bot.send_message(ADMIN_ID,
-            f"🎁 Реферальная награда\n\n"
-            f"👤 {inv_name} ({inviter_id})\n"
-            f"🏆 Награда: {reward}\n"
-            f"👥 Рефералов: {valid_refs}"
-        )
-        if gift_id:
-            try:
-                star_balance = await bot.get_my_star_balance()
-                cost = int(reward.replace("⭐", "").strip())
-                if star_balance.amount < cost:
-                    await db.add_pending_gift(inviter_id, inv_name, gift_id, f"реф. награда {reward}")
-                    await bot.send_message(ADMIN_ID,
-                        f"⚠️ Недостаточно звёзд!\n\n💫 Баланс: {star_balance.amount}⭐\n"
-                        f"👤 {inv_name} ({inviter_id})\n🏆 {reward}\nДобавлен в /pending"
-                    )
-                else:
-                    await bot.send_gift(user_id=inviter_id, gift_id=gift_id)
-                    await send_log(bot, f"🎁 Реф. подарок отправлен\n\n{inv_name} ({inviter_id})\n{reward}")
-            except Exception as e:
-                logger.warning("send ref gift failed: %s", e)
-                await db.add_pending_gift(inviter_id, inv_name, gift_id, f"реф. награда {reward} — ошибка: {e}")
-                await bot.send_message(ADMIN_ID,
-                    f"❌ Не удалось отправить реф. подарок\n\n"
-                    f"👤 {inv_name} ({inviter_id})\n🏆 {reward}\n📛 {e}\nДобавлен в /pending"
-                )
-
-
 async def send_gift_safe(bot: Bot, user_id: int, user_name: str, gift_id: str, reason: str) -> None:
     try:
         star_balance = await bot.get_my_star_balance()
@@ -1159,20 +1027,21 @@ async def send_gift_safe(bot: Bot, user_id: int, user_name: str, gift_id: str, r
 async def casino_timeout_checker(bot: Bot) -> None:
     while True:
         await asyncio.sleep(30)
-        now = time.time()
-        expired = [uid for uid, g in active_games.items() if g["expires"] < now]
-        for uid in expired:
-            game = active_games.pop(uid)
-            bet  = game["bet"]
-            chat_id = game.get("chat_id", MAIN_CHAT_ID)
-            await db.add_coins(uid, bet)
-            try:
-                await bot.send_message(
-                    chat_id,
-                    f"⏰ Время вышло! Ставка {bet} D-COINS возвращена на твой баланс.",
-                )
-            except Exception:
-                pass
+        async with game_action_lock:
+            now = time.time()
+            expired = [uid for uid, g in active_games.items() if g["expires"] < now]
+            for uid in expired:
+                game = active_games.pop(uid)
+                bet  = game["bet"]
+                chat_id = game.get("chat_id", MAIN_CHAT_ID)
+                await db.add_coins(uid, bet)
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        f"⏰ Время вышло! Ставка {bet} D-COINS возвращена на твой баланс.",
+                    )
+                except Exception:
+                    pass
 
 
 def release_duel(duel_id: str) -> dict | None:
@@ -1188,28 +1057,29 @@ def release_duel(duel_id: str) -> dict | None:
 async def duel_timeout_checker(bot: Bot) -> None:
     while True:
         await asyncio.sleep(5)
-        now = time.time()
-        expired_ids = [
-            duel_id for duel_id, duel in active_duels.items()
-            if duel.get("status") == "open" and duel["expires"] <= now
-        ]
-        for duel_id in expired_ids:
-            duel = release_duel(duel_id)
-            if not duel:
-                continue
-            try:
-                await bot.edit_message_text(
-                    chat_id=duel["chat_id"],
-                    message_id=duel["message_id"],
-                    text=(
-                        "⌛ Дуэль отменена\n\n"
-                        f"Игрок: {duel['challenger_name']}\n"
-                        f"Ставка: {duel['bet']:,} DC\n"
-                        "Никто не принял вызов за 5 минут."
-                    ).replace(",", " "),
-                )
-            except Exception as e:
-                logger.warning("Could not expire duel %s: %s", duel_id, e)
+        async with game_action_lock:
+            now = time.time()
+            expired_ids = [
+                duel_id for duel_id, duel in active_duels.items()
+                if duel.get("status") == "open" and duel["expires"] <= now
+            ]
+            for duel_id in expired_ids:
+                duel = release_duel(duel_id)
+                if not duel:
+                    continue
+                try:
+                    await bot.edit_message_text(
+                        chat_id=duel["chat_id"],
+                        message_id=duel["message_id"],
+                        text=(
+                            "⌛ Дуэль отменена\n\n"
+                            f"Игрок: {duel['challenger_name']}\n"
+                            f"Ставка: {duel['bet']:,} DC\n"
+                            "Никто не принял вызов за 5 минут."
+                        ).replace(",", " "),
+                    )
+                except Exception as e:
+                    logger.warning("Could not expire duel %s: %s", duel_id, e)
 
 
 # =========================
@@ -1222,24 +1092,492 @@ casino_bet_cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=CASINO_BET_COOLDOW
 case_open_cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=CASE_OPEN_COOLDOWN)
 duel_cooldowns: TTLCache = TTLCache(maxsize=50_000, ttl=DUEL_COOLDOWN)
 
+# This block is embedded into the standalone bot file by the development workflow.
+import json
+import secrets
+from contextlib import asynccontextmanager
+from functools import wraps
+
+# Serialize game actions that share in-memory state across awaited DB operations.
+game_action_lock = asyncio.Lock()
+
+
+def serialized_game(function):
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        async with game_action_lock:
+            return await function(*args, **kwargs)
+    return wrapped
+
+QUESTS = {
+    "messages15": ("📚 Написать 15 сообщений", "messages", 15, 1500, 50),
+    "messages30": ("✍️ Написать 30 сообщений", "messages", 30, 3000, 100),
+    "bonus": ("🎁 Забрать ежедневный бонус", "bonus", 1, 1000, 30),
+    "duels": ("⚔️ Сыграть 2 дуэли", "duels", 2, 2000, 75),
+    "duelwin": ("🏆 Победить в дуэли", "duelwin", 1, 3000, 120),
+    "games": ("🎰 Завершить 3 игры", "games", 3, 1500, 60),
+    "gamewin": ("🍀 Выиграть в игре", "gamewin", 1, 2500, 100),
+    "safe": ("💣 Открыть 5 безопасных клеток", "safe", 5, 2000, 80),
+    "case": ("📦 Открыть кейс за DC", "case", 1, 3000, 150),
+    "bets": ("💰 Сыграть на 10 000 DC", "bets", 10000, 4000, 180),
+}
+
+# Level -> list of rewards. The last level contains two ordinary prizes.
+PATH_REWARDS = {
+    1: [("coins", 500)], 2: [("coins", 500)], 3: [("school", 1)],
+    4: [("coins", 750)], 5: [("coins", 2000)], 6: [("coins", 750)],
+    7: [("school", 1)], 8: [("coins", 1000)], 9: [("coins", 1000)],
+    10: [("coins", 3500)], 11: [("coins", 1000)], 12: [("school", 1)],
+    13: [("coins", 1250)], 14: [("coins", 1250)], 15: [("coins", 3000)],
+    16: [("student", 1)], 17: [("coins", 1500)], 18: [("coins", 1500)],
+    19: [("school", 1)], 20: [("coins", 5500)], 21: [("coins", 1500)],
+    22: [("coins", 1500)], 23: [("school", 1)], 24: [("coins", 2000)],
+    25: [("coins", 5000)], 26: [("coins", 2000)], 27: [("student", 1)],
+    28: [("coins", 2500)], 29: [("coins", 2500)], 30: [("coins", 5000)],
+    31: [("coins", 2500)], 32: [("school", 1)], 33: [("coins", 3000)],
+    34: [("coins", 3000)], 35: [("coins", 7000)], 36: [("student", 1)],
+    37: [("coins", 3500)], 38: [("coins", 3500)], 39: [("school", 1)],
+    40: [("gift", 15)], 41: [("coins", 4000)], 42: [("student", 1)],
+    43: [("coins", 4000)], 44: [("school", 1)], 45: [("excellent", 1)],
+    46: [("coins", 5000)], 47: [("coins", 5000)], 48: [("student", 1)],
+    49: [("coins", 7000)], 50: [("gift", 25), ("excellent", 1)],
+}
+
+
+class SchoolEvent:
+    """All progression, claims, boss damage and refunds use SQLite transactions."""
+
+    def __init__(self, database):
+        self.database = database
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with aiosqlite.connect(self.database.path, timeout=30) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def one(self, conn, sql, args=()):
+        async with conn.execute(sql, args) as cursor:
+            return await cursor.fetchone()
+
+    async def init(self):
+        async with self.transaction() as c:
+            for sql in (
+                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER)",
+                "CREATE TABLE IF NOT EXISTS school_players (season INTEGER, uid INTEGER, name TEXT, knowledge INTEGER DEFAULT 0, damage INTEGER DEFAULT 0, reached REAL DEFAULT 0, last_message REAL DEFAULT 0, PRIMARY KEY(season,uid))",
+                "CREATE TABLE IF NOT EXISTS school_quests (season INTEGER, uid INTEGER, day TEXT, quest TEXT, progress INTEGER DEFAULT 0, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day,quest))",
+                "CREATE TABLE IF NOT EXISTS school_days (season INTEGER, uid INTEGER, day TEXT, streak INTEGER, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day))",
+                "CREATE TABLE IF NOT EXISTS school_claims (season INTEGER, uid INTEGER, prize TEXT, PRIMARY KEY(season,uid,prize))",
+                "CREATE TABLE IF NOT EXISTS school_actions (season INTEGER, uid INTEGER, token TEXT, PRIMARY KEY(season,uid,token))",
+                "CREATE TABLE IF NOT EXISTS school_prizes (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, uid INTEGER, reason TEXT, kind TEXT, amount INTEGER, done INTEGER DEFAULT 0, UNIQUE(season,uid,reason,kind))",
+                "CREATE TABLE IF NOT EXISTS school_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, tag TEXT, text TEXT, sent INTEGER DEFAULT 0, UNIQUE(season,tag))",
+            ):
+                await c.execute(sql)
+
+    async def current(self, c, now=None, active=True):
+        row = await self.one(c, "SELECT * FROM school_seasons ORDER BY id DESC LIMIT 1")
+        if active and row and (row["stopped"] or (now or time.time()) >= row["ends"]):
+            return None
+        return row
+
+    async def start(self):
+        async with self.transaction() as c:
+            if await self.current(c):
+                return False
+            now = time.time()
+            await c.execute("INSERT INTO school_seasons(started,ends,hp,max_hp) VALUES (?,?,5000000,5000000)", (now, now + 20 * 86400))
+            return True
+
+    async def stop(self, season):
+        async with self.transaction() as c:
+            await c.execute("UPDATE school_seasons SET stopped=1 WHERE id=?", (season,))
+
+    async def coins(self, c, uid, amount):
+        await c.execute("INSERT INTO coins(user_id,balance) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET balance=balance+?", (uid, COINS_START + amount, amount))
+
+    async def reward(self, c, season, uid, reason, items):
+        for kind, amount in items:
+            if kind == "coins":
+                await self.coins(c, uid, amount)
+            elif kind in CASES:
+                await c.execute("INSERT INTO case_keys(user_id,case_id,amount) VALUES (?,?,?) ON CONFLICT(user_id,case_id) DO UPDATE SET amount=amount+excluded.amount", (uid, kind, amount))
+            else:
+                # Real prizes are queued for an administrator; no duplicate external sends.
+                await c.execute("INSERT OR IGNORE INTO school_prizes(season,uid,reason,kind,amount) VALUES (?,?,?,?,?)", (season, uid, reason, kind, amount))
+
+    async def prepare(self, c, season, uid, name, now):
+        day = datetime.fromtimestamp(now, pytz.timezone("Europe/Moscow")).date().isoformat()
+        await c.execute("INSERT INTO school_players(season,uid,name) VALUES (?,?,?) ON CONFLICT(season,uid) DO UPDATE SET name=excluded.name", (season, uid, name))
+        exists = await self.one(c, "SELECT 1 FROM school_quests WHERE season=? AND uid=? AND day=?", (season, uid, day))
+        if not exists:
+            chosen = secrets.SystemRandom().sample(list(QUESTS), 3)
+            await c.executemany("INSERT INTO school_quests(season,uid,day,quest) VALUES (?,?,?,?)", [(season, uid, day, q) for q in chosen])
+        return day
+
+    async def progress(self, c, season, uid, name, day, now, metrics):
+        player = await self.one(c, "SELECT * FROM school_players WHERE season=? AND uid=?", (season, uid))
+        metrics = dict(metrics)
+        if metrics.get("messages"):
+            if now - player["last_message"] < 10:
+                metrics.pop("messages")
+            else:
+                await c.execute("UPDATE school_players SET last_message=? WHERE season=? AND uid=?", (now, season, uid))
+        async with c.execute("SELECT * FROM school_quests WHERE season=? AND uid=? AND day=?", (season, uid, day)) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            _, metric, target, _, _ = QUESTS[row["quest"]]
+            value = max(0, int(metrics.get(metric, 0)))
+            if value:
+                await c.execute("UPDATE school_quests SET progress=MIN(?,progress+?) WHERE season=? AND uid=? AND day=? AND quest=?", (target, value, season, uid, day, row["quest"]))
+        async with c.execute("SELECT quest,progress FROM school_quests WHERE season=? AND uid=? AND day=?", (season, uid, day)) as cur:
+            complete = all(row["progress"] >= QUESTS[row["quest"]][2] for row in await cur.fetchall())
+        if complete:
+            yesterday = (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat()
+            previous = await self.one(c, "SELECT streak FROM school_days WHERE season=? AND uid=? AND day=?", (season, uid, yesterday))
+            streak = previous[0] % 5 + 1 if previous else 1
+            await c.execute("INSERT OR IGNORE INTO school_days(season,uid,day,streak) VALUES (?,?,?,?)", (season, uid, day, streak))
+
+    async def record(self, uid, name, token, metrics=None, loss=0, now=None):
+        now = time.time() if now is None else now
+        async with self.transaction() as c:
+            season = await self.current(c, now)
+            if not season or uid <= 0:
+                return 0, 0
+            sid = season["id"]
+            cur = await c.execute("INSERT OR IGNORE INTO school_actions(season,uid,token) VALUES (?,?,?)", (sid, uid, token))
+            if cur.rowcount != 1:
+                return 0, 0
+            day = await self.prepare(c, sid, uid, name, now)
+            await self.progress(c, sid, uid, name, day, now, metrics or {})
+            damage = refund = 0
+            if loss > 0 and season["hp"] > 0:
+                damage = min(int(loss), season["hp"])
+                refund = int(loss) - damage
+                await c.execute("UPDATE school_players SET damage=damage+?, reached=? WHERE season=? AND uid=?", (damage, now, sid, uid))
+                await c.execute("UPDATE school_seasons SET hp=hp-? WHERE id=?", (damage, sid))
+                if refund:
+                    await self.coins(c, uid, refund)
+                if damage == season["hp"]:
+                    await c.execute("UPDATE school_seasons SET killed=? WHERE id=?", (now, sid))
+                    async with c.execute("SELECT * FROM school_players WHERE season=? AND damage>0 ORDER BY damage DESC,reached,uid", (sid,)) as cur:
+                        players = await cur.fetchall()
+                    for p in players:
+                        rewards = []
+                        if p["damage"] >= 10000:
+                            rewards.append(("coins", 10000))
+                        if p["damage"] >= 100000:
+                            rewards.append(("excellent", 1))
+                        await self.reward(c, sid, p["uid"], "Победа над боссом", rewards)
+                    await self.reward(c, sid, uid, "Последний удар", [("coins", 50000)])
+                    for place, p in enumerate(players[:3], 1):
+                        await self.reward(c, sid, p["uid"], f"Топ-{place} по урону", [[("nft", 1)], [("premium", 1)], [("gift", 100)]][place - 1])
+                    top = "\n".join(f"{i}. {p['name']} — {p['damage']:,}" for i, p in enumerate(players[:3], 1))
+                    await c.execute("INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)", (sid, "boss", f"🏆 Архимед Знаний побеждён!\n\n{top}\n\nПоследний удар: {name}.\nDC и ключи начислены. NFT, Premium и подарок топ-3 выдаст администратор. Призовой путь продолжается!"))
+            return damage, refund
+
+    async def claim(self, sid, uid, name, category, value):
+        async with self.transaction() as c:
+            season = await self.current(c)
+            if not season or season["id"] != sid:
+                return "Ивент завершён или эта кнопка устарела."
+            now = time.time()
+            day = await self.prepare(c, sid, uid, name, now)
+            if category == "quest":
+                qday, qid = value.split("/", 1)
+                if qday != day or qid not in QUESTS:
+                    return "Задание устарело."
+                row = await self.one(c, "SELECT * FROM school_quests WHERE season=? AND uid=? AND day=? AND quest=?", (sid, uid, day, qid))
+                if not row or row["progress"] < QUESTS[qid][2]:
+                    return "Сначала выполни задание."
+                if row["claimed"]:
+                    return "Награда уже получена."
+                await c.execute("UPDATE school_quests SET claimed=1 WHERE season=? AND uid=? AND day=? AND quest=?", (sid, uid, day, qid))
+                _, _, _, dc, points = QUESTS[qid]
+                await self.coins(c, uid, dc)
+                await c.execute("UPDATE school_players SET knowledge=knowledge+? WHERE season=? AND uid=?", (points, sid, uid))
+                p = await self.one(c, "SELECT knowledge FROM school_players WHERE season=? AND uid=?", (sid, uid))
+                if p[0] >= 5000:
+                    cur = await c.execute("UPDATE school_seasons SET path_winner=? WHERE id=? AND path_winner IS NULL", (uid, sid))
+                    if cur.rowcount == 1:
+                        await self.reward(c, sid, uid, "Первый на уровне 50", [("nft", 1)])
+                        await c.execute("INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)", (sid, "race", f"🏁 {name} первым достиг 50-го уровня!\n🏆 Отдельный NFT ждёт выдачи администратором. Остальные участники продолжают призовой путь."))
+                return f"✅ +{dc:,} DC и +{points} 📖"
+            if category == "day":
+                if value != day:
+                    return "Бонус относится к другому дню."
+                row = await self.one(c, "SELECT * FROM school_days WHERE season=? AND uid=? AND day=?", (sid, uid, day))
+                if not row:
+                    return "Выполни все три задания."
+                if row["claimed"]:
+                    return "Бонус уже получен."
+                await c.execute("UPDATE school_days SET claimed=1 WHERE season=? AND uid=? AND day=?", (sid, uid, day))
+                rewards = [("coins", 3000)]
+                if row["streak"] == 5:
+                    rewards.append(("excellent", 1))
+                await self.reward(c, sid, uid, "Серия квестов", rewards)
+                return "✅ +3 000 DC" + (" и 🔑 Кейс отличника за 5 дней подряд!" if row["streak"] == 5 else "")
+            if category == "level":
+                level = int(value)
+                player = await self.one(c, "SELECT knowledge FROM school_players WHERE season=? AND uid=?", (sid, uid))
+                if level not in PATH_REWARDS or player[0] < level * 100:
+                    return "Этот уровень ещё не достигнут."
+                cur = await c.execute("INSERT OR IGNORE INTO school_claims(season,uid,prize) VALUES (?,?,?)", (sid, uid, f"level:{level}"))
+                if cur.rowcount != 1:
+                    return "Награда уже получена."
+                await self.reward(c, sid, uid, f"Уровень {level}", PATH_REWARDS[level])
+                return "✅ Награда получена. Подарки переданы на выдачу администратору."
+            return "Неизвестная награда."
+
+
+school_event = SchoolEvent(db)
+
+
+def event_reward_text(items):
+    labels = []
+    for kind, amount in items:
+        if kind == "coins":
+            labels.append(f"{amount:,} DC")
+        elif kind in CASES:
+            labels.append(f"🔑 {CASES[kind]['title']} ×{amount}")
+        else:
+            labels.append({"gift": f"🎁 {amount}⭐", "nft": "NFT", "premium": "Premium на месяц"}[kind])
+    return " + ".join(labels).replace(",", " ")
+
+
+def event_navigation():
+    return [
+        [InlineKeyboardButton(text="📚 Босс", callback_data="school:boss"), InlineKeyboardButton(text="🏆 Топ по урону", callback_data="school:top")],
+        [InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"), InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0")],
+    ]
+
+
+async def event_page(uid, name, page):
+    buttons = []
+    async with school_event.transaction() as c:
+        season = await school_event.current(c, active=False)
+        if not season:
+            return "🏫 Школьный ивент ещё не запущен.", InlineKeyboardMarkup(inline_keyboard=event_navigation())
+        sid = season["id"]
+        now = time.time()
+        active = not season["stopped"] and now < season["ends"]
+        day = await school_event.prepare(c, sid, uid, name, now) if active else datetime.fromtimestamp(now, pytz.timezone("Europe/Moscow")).date().isoformat()
+        p = await school_event.one(c, "SELECT * FROM school_players WHERE season=? AND uid=?", (sid, uid))
+        knowledge = p["knowledge"] if p else 0
+        footer = "" if active else "\n\n⏳ Ивент завершён."
+        if page == "quests":
+            async with c.execute("SELECT * FROM school_quests WHERE season=? AND uid=? AND day=? ORDER BY quest", (sid, uid, day)) as cur:
+                quests = await cur.fetchall()
+            lines = [f"⭐ Квесты · {day} (МСК)", f"📖 Очки знаний: {knowledge}", "Смена заданий в 00:00 МСК. Награды забирай сегодня.", ""]
+            for row in quests:
+                label, _, target, dc, points = QUESTS[row["quest"]]
+                lines.append(f"{label}\n{row['progress']}/{target} · {dc:,} DC + {points} 📖")
+                if active and row["progress"] >= target and not row["claimed"]:
+                    buttons.append([InlineKeyboardButton(text=f"🎁 Забрать: {label}", callback_data=f"scq:{sid}:{uid}:{day}/{row['quest']}")])
+                elif row["claimed"]:
+                    lines.append("✅ Получено")
+            today = await school_event.one(c, "SELECT * FROM school_days WHERE season=? AND uid=? AND day=?", (sid, uid, day))
+            yesterday = (datetime.fromisoformat(day) - timedelta(days=1)).date().isoformat()
+            prev = await school_event.one(c, "SELECT streak FROM school_days WHERE season=? AND uid=? AND day=?", (sid, uid, yesterday))
+            streak = today["streak"] if today else (prev[0] % 5 if prev else 0)
+            lines.append(f"\n🔥 Серия: {streak}/5 дней\nЗа все 3 задания: 3 000 DC. За 5 дней: 🔑 Отличника.")
+            if active and today and not today["claimed"]:
+                buttons.append([InlineKeyboardButton(text="🎁 Бонус за все квесты", callback_data=f"scd:{sid}:{uid}:{day}")])
+            buttons.append([InlineKeyboardButton(text="🔄 Обновить задания", callback_data="school:quests")])
+            text = "\n".join(lines) + footer
+        elif page.startswith("path"):
+            try:
+                offset = max(0, min(4, int(page.split(":")[1])))
+            except (IndexError, ValueError):
+                offset = 0
+            async with c.execute("SELECT prize FROM school_claims WHERE season=? AND uid=?", (sid, uid)) as cur:
+                claimed = {r[0] for r in await cur.fetchall()}
+            lines = [f"📖 Призовой путь · {knowledge}/5 000", f"Уровень: {min(50,knowledge // 100)}/50", "Каждые 100 📖 — новый уровень. Первый на 50-м получает NFT.", ""]
+            for level in range(offset * 10 + 1, offset * 10 + 11):
+                status = "✅" if f"level:{level}" in claimed else ("🎁" if knowledge >= level * 100 else "🔒")
+                lines.append(f"{status} {level}. {event_reward_text(PATH_REWARDS[level])}")
+                if active and status == "🎁":
+                    buttons.append([InlineKeyboardButton(text=f"Забрать уровень {level}", callback_data=f"scl:{sid}:{uid}:{level}")])
+            buttons.append([InlineKeyboardButton(text=str(i * 10 + 1) + "–" + str(i * 10 + 10), callback_data=f"school:path:{i}") for i in range(5)])
+            text = "\n".join(lines) + footer
+        else:
+            async with c.execute("SELECT * FROM school_players WHERE season=? AND damage>0 ORDER BY damage DESC,reached,uid", (sid,)) as cur:
+                ranked = await cur.fetchall()
+            rank = next((str(i) for i, r in enumerate(ranked, 1) if r["uid"] == uid), "—")
+            if page == "top":
+                text = "🏆 Топ по урону Архимеду\n\n" + ("\n".join(f"{i}. {r['name']} — {r['damage']:,}" for i, r in enumerate(ranked[:10], 1)) or "Урона пока нет.")
+                text += f"\n\nТвоё место: {rank}\n🥇 NFT · 🥈 Premium · 🥉 подарок 100⭐" + footer
+                buttons.append([InlineKeyboardButton(text="🔄 Обновить топ", callback_data="school:top")])
+            else:
+                hours = max(0, int((season["ends"] - now) / 3600))
+                text = f"📚 Архимед Знаний\n❤️ {season['hp']:,} / {season['max_hp']:,} HP\n⚔️ Твой урон: {p['damage'] if p else 0:,}\n🏆 Твоё место: {rank}\n⏳ Осталось: {hours // 24} д. {hours % 24} ч."
+                text += "\n\nПроигранные ставки наносят урон. Дуэли не учитываются. Очки знаний идут только в призовой путь."
+                text += "\nЗа победу: от 10 000 урона — 10 000 DC; от 100 000 — также ключ Отличника. Последний удар: 50 000 DC."
+                if season["hp"] == 0:
+                    text += "\n\n🏆 Босс побеждён! Рейтинг зафиксирован."
+                text += footer
+                buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="school:boss")])
+    buttons.extend(event_navigation())
+    return text.replace(",", " "), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(F.text.regexp(r"(?i)^/?(ивент|квесты|путь|event|quests|path)(?:@\w+)?$"))
+async def school_command(message: Message):
+    if not message.from_user or message.sender_chat or message.from_user.is_bot:
+        return
+    if message.chat.type != "private" and message.chat.id != MAIN_CHAT_ID:
+        return
+    if await db.is_banned(message.from_user.id):
+        return
+    word = message.text.lower().lstrip("/").split("@")[0]
+    page = "quests" if word in {"квесты", "quests"} else "path:0" if word in {"путь", "path"} else "boss"
+    text, keyboard = await event_page(message.from_user.id, display_name(message.from_user), page)
+    await message.answer(text, reply_markup=keyboard)
+
+
+async def school_edit(callback, page):
+    text, keyboard = await event_page(callback.from_user.id, display_name(callback.from_user), page)
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except Exception as error:
+        if "message is not modified" not in str(error).lower():
+            raise
+
+
+@router.callback_query(F.data.startswith("school:"))
+async def school_callback(callback: CallbackQuery):
+    if await db.is_banned(callback.from_user.id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    await school_edit(callback, callback.data.split(":", 1)[1])
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("scq:") | F.data.startswith("scd:") | F.data.startswith("scl:"))
+async def school_claim_callback(callback: CallbackQuery):
+    if await db.is_banned(callback.from_user.id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    try:
+        kind, sid, owner, value = callback.data.split(":", 3)
+        if int(owner) != callback.from_user.id:
+            await callback.answer("Это награда другого игрока.", show_alert=True)
+            return
+        category = {"scq": "quest", "scd": "day", "scl": "level"}[kind]
+        result = await school_event.claim(int(sid), int(owner), display_name(callback.from_user), category, value)
+    except (ValueError, KeyError):
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    await callback.answer(result[:190], show_alert=True)
+    await school_edit(callback, f"path:{(int(value)-1)//10}" if kind == "scl" else "quests")
+
+
+async def school_admin_page(callback, page=0):
+    async with school_event.transaction() as c:
+        season = await school_event.current(c, active=False)
+        async with c.execute("SELECT * FROM school_prizes WHERE done=0 ORDER BY id LIMIT 10 OFFSET ?", (page * 10,)) as cur:
+            prizes = await cur.fetchall()
+        total = (await school_event.one(c, "SELECT COUNT(*) FROM school_prizes WHERE done=0"))[0]
+    text = "🏫 Управление школьным ивентом\n"
+    if season:
+        text += f"Сезон #{season['id']} · HP {season['hp']:,}/{season['max_hp']:,}\n"
+        text += "Окончание: " + datetime.fromtimestamp(season["ends"], pytz.timezone("Europe/Moscow")).strftime("%d.%m.%Y %H:%M МСК") + "\n"
+    text += f"\n🎁 Ожидают ручной выдачи: {total}\nСначала выдай приз, затем отметь заявку.\n"
+    buttons = [[InlineKeyboardButton(text="▶️ Запустить на 20 дней", callback_data="sca:startask")]]
+    if season:
+        buttons.append([InlineKeyboardButton(text="⏹ Завершить ивент", callback_data=f"sca:stopask:{season['id']}")])
+    for row in prizes:
+        text += f"\n#{row['id']} · ID {row['uid']} · {row['reason']} · {event_reward_text([(row['kind'],row['amount'])])}"
+        buttons.append([InlineKeyboardButton(text=f"✅ Приз #{row['id']} выдан", callback_data=f"sca:doneask:{row['id']}")])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"sca:page:{page-1}"))
+    if (page + 1) * 10 < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"sca:page:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="sca:page:0"), InlineKeyboardButton(text="◀️ Админка", callback_data="admin_panel")])
+    try:
+        await callback.message.edit_text(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+@router.callback_query(F.data.startswith("sca:"))
+async def school_admin_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID or callback.message.chat.type != "private":
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    action = parts[1]
+    if action.endswith("ask"):
+        confirm = callback.data.replace("ask", "", 1)
+        descriptions = {"startask": "Запустить новый ивент на 20 дней с 5 000 000 HP?", "stopask": "Завершить ивент сейчас? Прогресс и получение наград остановятся. Награды за непобеждённого босса не выдаются.", "doneask": "Приз действительно выдан игроку?"}
+        await callback.message.edit_text(descriptions[action], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data=confirm)],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="sca:page:0")],
+        ]))
+        await callback.answer()
+        return
+    if action == "start":
+        ok = await school_event.start()
+        await callback.answer("Ивент запущен" if ok else "Ивент уже идёт", show_alert=True)
+    elif action == "stop":
+        await school_event.stop(int(parts[2]))
+        await callback.answer("Ивент завершён")
+    elif action == "done":
+        async with school_event.transaction() as c:
+            await c.execute("UPDATE school_prizes SET done=1 WHERE id=? AND done=0", (int(parts[2]),))
+        await callback.answer("Выдача отмечена")
+    else:
+        await callback.answer()
+    await school_admin_page(callback, max(0, int(parts[2])) if action == "page" else 0)
+
+
+async def school_notifications(bot):
+    # Durable outbox retries notifications after a restart or temporary API failure.
+    while True:
+        try:
+            async with school_event.transaction() as c:
+                async with c.execute("SELECT * FROM school_outbox WHERE sent=0 ORDER BY id LIMIT 5") as cur:
+                    rows = await cur.fetchall()
+            for row in rows:
+                await bot.send_message(MAIN_CHAT_ID, row["text"])
+                async with school_event.transaction() as c:
+                    await c.execute("UPDATE school_outbox SET sent=1 WHERE id=?", (row["id"],))
+        except Exception:
+            logger.exception("School event notification failed")
+        await asyncio.sleep(5)
+
+
+async def school_game(user, token, bet, won):
+    damage, refund = await school_event.record(user.id, display_name(user), token,
+        {"games": 1, "gamewin": int(won), "bets": bet}, loss=0 if won else bet)
+    return f"\n📚 Урон боссу: {damage:,}. Возвращено: {refund:,} DC" if damage else ""
+
 PLAIN_COMMANDS = {
-    "start", "help", "ref", "refstats", "say", "vip", "unvip", "viplist",
+    "start", "help", "say", "vip", "unvip", "viplist",
     "ban", "unban", "banlist", "addmsgs", "removemsgs", "addday", "removeday",
     "addcoins", "removecoins", "createpromo", "deletepromo", "createcasepromo",
-    "promos", "addrefs", "removerefs", "balance", "popolnit", "sendgift",
+    "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
-    "stats", "top", "winstop", "reftop", "cointop",
+    "stats", "top", "winstop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
     "roulette", "dice", "mines", "duel", "exchange", "admin",
 }
 
 RUSSIAN_COMMANDS = {
     "старт": "start", "начать": "start", "помощь": "help",
-    "реф": "ref", "реферал": "ref", "рефы": "refstats",
     "кейсы": "cases", "баланс": "coins", "монеты": "coins",
     "обмен": "exchange", "бонус": "bonus", "стата": "stats",
     "статистика": "stats", "топ": "top", "победители": "winstop",
-    "топреф": "reftop", "топкоинов": "cointop", "дневнойтоп": "daytop",
+    "топкоинов": "cointop", "дневнойтоп": "daytop",
     "промо": "promo", "перевод": "transfer", "слоты": "slots",
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
     "удалитьзаявку": "deletepending",
@@ -1265,8 +1603,8 @@ def is_plain_command(message: Message) -> bool:
 
 def start_keyboard(is_admin: bool = False):
     buttons = [
-        [InlineKeyboardButton(text="🔗 Реферальная ссылка", callback_data="ref")],
-        [InlineKeyboardButton(text="📊 Реферальная статистика", callback_data="refstats")],
+        [InlineKeyboardButton(text="🏫 Школьный ивент", callback_data="school:boss")],
+        [InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"), InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0")],
         [InlineKeyboardButton(text="📦 Кейсы", callback_data="cases")],
         [InlineKeyboardButton(text="⭐ Купить D-COINS", callback_data="buy_dc_menu")],
         [InlineKeyboardButton(text="❓ Как играть", callback_data="help")],
@@ -1322,7 +1660,9 @@ def buy_dc_keyboard() -> InlineKeyboardMarkup:
 
 def cases_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 KARAPUZ — 1 000 DC", callback_data="case_view_karapuz")],
+        [InlineKeyboardButton(text="🎒 ШКОЛЬНЫЙ — 3 000 DC", callback_data="case_view_school")],
+        [InlineKeyboardButton(text="🎓 СТУДЕНЧЕСКИЙ — 12 000 DC", callback_data="case_view_student")],
+        [InlineKeyboardButton(text="🏆 КЕЙС ОТЛИЧНИКА — только 🔑", callback_data="case_view_excellent")],
         [InlineKeyboardButton(text="🩸 BLOOD — 5 000 DC", callback_data="case_view_blood")],
         [InlineKeyboardButton(text="🐆 PANTERA — 10 000 DC", callback_data="case_view_pantera")],
         [InlineKeyboardButton(text="🕷 SPIDER MAN — 7 500 DC", callback_data="case_view_spider_man")],
@@ -1362,16 +1702,6 @@ async def check_subscription(callback: CallbackQuery, bot: Bot) -> None:
     )
     await callback.answer("✅ Подписка подтверждена")
 
-@router.callback_query(F.data == "ref")
-async def ref_callback(callback: CallbackQuery, bot: Bot):
-    await cmd_ref(callback.message, bot)
-    await callback.answer()
-
-@router.callback_query(F.data == "refstats")
-async def refstats_callback(callback: CallbackQuery):
-    await cmd_refstats(callback.message)
-    await callback.answer()
-
 async def send_help(message: Message) -> None:
     await message.answer(
         "📖 Как играть\n\n"
@@ -1394,7 +1724,6 @@ async def send_help(message: Message) -> None:
         "• обмен — обмен DC на шанс, подарки или Premium\n"
         "• промо КОД — активировать промокод\n"
         "• перевод @username сумма — отправить DC игроку\n"
-        "• реферал — получить ссылку\n"
         "• стата — статистика в основном чате\n\n"
         "Команды пишутся без /"
     )
@@ -1412,53 +1741,6 @@ async def cmd_help(message: Message) -> None:
 async def help_callback(callback: CallbackQuery) -> None:
     await send_help(callback.message)
     await callback.answer()
-
-# =========================
-# PRIVATE — /ref
-# =========================
-
-@router.message(Command("ref"), F.chat.type == "private")
-async def cmd_ref(message: Message, bot: Bot) -> None:
-    user_id  = message.from_user.id
-    existing = await db.get_invite_link(user_id)
-    if existing:
-        await message.answer(
-            f"👥 Твоя реферальная ссылка:\n\n{existing}\n\n"
-            f"Поделись ей — за каждого активного реферала получишь +{REF_BONUS}% к шансу!"
-        )
-        return
-    try:
-        link = await bot.create_chat_invite_link(chat_id=MAIN_CHAT_ID, name=f"ref_{user_id}", creates_join_request=False)
-    except Exception as e:
-        logger.error("create_chat_invite_link error for %s: %s", user_id, e)
-        await message.answer("❌ Не удалось создать ссылку. Попробуй позже.")
-        return
-    await db.save_invite_link(user_id, link.invite_link)
-    await message.answer(
-        f"👥 Твоя реферальная ссылка:\n\n{link.invite_link}\n\n"
-        f"Поделись ей — за каждого активного реферала получишь +{REF_BONUS}% к шансу!"
-    )
-
-# =========================
-# PRIVATE — /refstats
-# =========================
-
-@router.message(Command("refstats"), F.chat.type == "private")
-async def cmd_refstats(message: Message) -> None:
-    user_id    = message.from_user.id
-    valid_refs = await db.count_valid_refs(user_id)
-    chance, _, _ = await db.get_user(user_id, MAIN_CHAT_ID)
-    next_reward = "🏅 Максимальная награда получена"
-    for level, reward in REF_REWARDS.items():
-        if valid_refs < level:
-            next_reward = f"{level - valid_refs} чел. → {reward}"
-            break
-    await message.answer(
-        f"📊 Реферальная статистика\n\n"
-        f"👥 Валидных рефералов: {valid_refs}\n"
-        f"🎁 Следующая награда: {next_reward}\n\n"
-        f"📈 Твой шанс: {chance:.3f}%"
-    )
 
 # =========================
 # PRIVATE — ADMIN COMMANDS
@@ -1763,7 +2045,7 @@ async def cmd_createcasepromo(message: Message, bot: Bot) -> None:
         return
     args = message.text.split()
     if len(args) not in (3, 4, 5):
-        await message.answer("Использование: /createcasepromo КОД КЕЙС [ключей] [лимит]\nПример: /createcasepromo KARAPUZFREE karapuz 1 100")
+        await message.answer("Использование: /createcasepromo КОД КЕЙС [ключей] [лимит]\nПример: /createcasepromo BLOODFREE blood 1 100")
         return
     code = args[1].upper()
     case_id = args[2].lower()
@@ -1805,86 +2087,6 @@ async def cmd_promos(message: Message) -> None:
         reward_text = f"{CASES[case_id]['title']} × {case_count}" if reward_type == "case" else f"{reward} DC"
         text += f"{code} — {reward_text} ({limit_text})\n"
     await message.answer(text)
-
-@router.message(Command("addrefs"), F.chat.type == "private")
-async def cmd_addrefs(message: Message, bot: Bot) -> None:
-    if message.from_user.id != ADMIN_ID:
-        return
-    args = message.text.split()
-    if len(args) < 3:
-        await message.answer("Использование: /addrefs user_id количество")
-        return
-    try:
-        user_id = int(args[1])
-        amount  = int(args[2])
-    except ValueError:
-        await message.answer("❌ Укажи числовой ID и количество.")
-        return
-    prev_refs = await db.count_valid_refs(user_id)
-    async with aiosqlite.connect(db.path) as conn:
-        for i in range(amount):
-            fake_id = -(user_id * 1000 + i)
-            await conn.execute(
-                "INSERT OR IGNORE INTO referrals (invited_user_id, inviter_user_id, valid) VALUES (?, ?, 1)",
-                (fake_id, user_id)
-            )
-        await conn.commit()
-    valid_refs = await db.count_valid_refs(user_id)
-    inv_name   = await db.get_user_name(user_id)
-    added = valid_refs - prev_refs
-    new_chance = None
-    if added > 0:
-        chance, msg_count, last_bonus = await db.get_user(user_id, MAIN_CHAT_ID)
-        new_chance = min(round(chance + REF_BONUS * added, 3), MAX_CHANCE)
-        await db.update_user(user_id, MAIN_CHAT_ID, inv_name, new_chance, msg_count, last_bonus)
-    await message.answer(
-        f"✅ Добавлено {amount} рефералов\n"
-        f"👤 {inv_name} ({user_id})\n"
-        f"👥 Всего валидных: {valid_refs}"
-        + (f"\n📈 Шанс: {new_chance:.3f}%" if new_chance else "")
-    )
-    for level, reward in REF_REWARDS.items():
-        if valid_refs >= level and prev_refs < level:
-            gift_ids = REF_GIFT_IDS.get(level, [])
-            gift_id  = random.choice(gift_ids) if gift_ids else None
-            await send_log(bot, f"🎁 Реф. награда\n\n👤 {inv_name} ({user_id})\n🏆 {reward}")
-            await bot.send_message(ADMIN_ID, f"🎁 Реф. награда\n\n👤 {inv_name} ({user_id})\n🏆 {reward}")
-            if gift_id:
-                try:
-                    await bot.send_gift(user_id=user_id, gift_id=gift_id)
-                except Exception as e:
-                    await db.add_pending_gift(user_id, inv_name, gift_id, f"реф. награда {reward} — ошибка: {e}")
-
-@router.message(Command("removerefs"), F.chat.type == "private")
-async def cmd_removerefs(message: Message) -> None:
-    if message.from_user.id != ADMIN_ID:
-        return
-    args = message.text.split()
-    if len(args) < 3:
-        await message.answer("Использование: /removerefs user_id количество")
-        return
-    try:
-        user_id = int(args[1])
-        amount  = int(args[2])
-    except ValueError:
-        await message.answer("❌ Укажи числовой ID и количество.")
-        return
-    async with aiosqlite.connect(db.path) as conn:
-        async with conn.execute(
-            "SELECT invited_user_id FROM referrals WHERE inviter_user_id=? AND invited_user_id < 0 LIMIT ?",
-            (user_id, amount)
-        ) as cur:
-            rows = await cur.fetchall()
-        for row in rows:
-            await conn.execute("DELETE FROM referrals WHERE invited_user_id=?", (row[0],))
-        await conn.commit()
-    valid_refs = await db.count_valid_refs(user_id)
-    inv_name   = await db.get_user_name(user_id)
-    await message.answer(
-        f"✅ Убрано {len(rows)} рефералов\n"
-        f"👤 {inv_name} ({user_id})\n"
-        f"👥 Осталось: {valid_refs}"
-    )
 
 @router.message(Command("balance"), F.chat.type == "private")
 async def cmd_balance(message: Message, bot: Bot) -> None:
@@ -2115,6 +2317,7 @@ async def cmd_premiumrefund(message: Message, bot: Bot) -> None:
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏫 Ивент и выдача призов", callback_data="sca:page:0")],
         [
             InlineKeyboardButton(text="📋 Pending", callback_data="admin_pending"),
             InlineKeyboardButton(text="💎 Premium", callback_data="admin_premium"),
@@ -2671,14 +2874,12 @@ async def cmd_stats(message: Message) -> None:
     user_id = message.from_user.id
     chance, msg_count, _ = await db.get_user(user_id, message.chat.id)
     wins = await db.get_wins_count(user_id, message.chat.id)
-    valid_refs = await db.count_valid_refs(user_id)
     balance, _ = await db.get_coins(user_id)
     await message.reply(
         f"📊 Статистика:\n\n"
         f"📈 Шанс: {chance:.3f}%\n"
         f"💬 Сообщений: {msg_count}\n"
         f"🏆 Побед: {wins}\n"
-        f"👥 Рефералов: {valid_refs}\n"
         f"🪙 D-COINS: {balance}"
     )
 
@@ -2709,22 +2910,6 @@ async def cmd_winstop(message: Message) -> None:
     text = "🏆 Топ победителей:\n\n"
     for i, (name, cnt) in enumerate(top, start=1):
         text += f"{i}. {name} — {cnt} поб.\n"
-    await message.reply(text)
-
-@router.message(Command("reftop"))
-async def cmd_reftop(message: Message) -> None:
-    if message.chat.id != MAIN_CHAT_ID:
-        return
-    if await db.is_banned(message.from_user.id):
-        await message.reply(BAN_MESSAGE)
-        return
-    top = await db.get_refs_top()
-    if not top:
-        await message.reply("👥 Рефералов пока нет.")
-        return
-    text = "👥 Топ по рефералам:\n\n"
-    for i, (_, name, cnt) in enumerate(top, start=1):
-        text += f"{i}. {name} — {cnt} реф.\n"
     await message.reply(text)
 
 @router.message(Command("cointop"))
@@ -2932,6 +3117,7 @@ async def cmd_bonus(message: Message) -> None:
         coins_amount = COINS_VIP_BONUS if is_vip else COINS_BONUS
         new_balance  = await db.add_coins(user_id, coins_amount)
         await db.set_coin_bonus_time(user_id)
+        await school_event.record(user_id, name, f"bonus:{message.chat.id}:{message.message_id}", {"bonus": 1})
         coin_text = f"🪙 D-COINS: +{coins_amount} → {new_balance} DC"
     else:
         left = COINS_BONUS_CD - (now - last_coin_bonus)
@@ -2969,9 +3155,10 @@ async def show_case(callback: CallbackQuery, case_id: str) -> None:
             value, _ = reward
             label = f"{value:,} DC".replace(",", " ")
         rewards.append(f"• {label}")
+    price_text = "🏆 Эксклюзив: только за ключ" if case.get("key_only") else f"💰 Цена: {case['price']:,} DC".replace(",", " ")
     await callback.message.edit_text(
         f"📦 Кейс {case['title']}\n\n"
-        f"💰 Цена: {case['price']:,} DC\n"
+        f"{price_text}\n"
         f"🔑 Твоих ключей: {keys}\n\n"
         f"🎁 Возможные награды:\n" + "\n".join(rewards),
         reply_markup=case_detail_keyboard(case_id),
@@ -3005,7 +3192,11 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
 
     case = CASES[case_id]
     case_open_cooldowns[user_id] = True
-    payment = await db.open_case(user_id, case_id, case["price"])
+    payment = await db.open_case(user_id, case_id, case["price"], case.get("key_only", False))
+    if payment == "key_required":
+        case_open_cooldowns.pop(user_id, None)
+        await callback.answer("🔑 Этот эксклюзивный кейс открывается только ключом из ивента, квеста или промокода.", show_alert=True)
+        return
     if payment == "insufficient":
         case_open_cooldowns.pop(user_id, None)
         balance, _ = await db.get_coins(user_id)
@@ -3013,6 +3204,8 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
         return
 
     if isinstance(case["rewards"][0][0], str):
+        if payment == "coins":
+            await school_event.record(user_id, display_name(callback.from_user), f"case:{callback.id}", {"case": 1})
         kind, reward, _ = random.choices(case["rewards"], weights=[item[2] for item in case["rewards"]], k=1)[0]
     else:
         reward, _ = random.choices(case["rewards"], weights=[item[1] for item in case["rewards"]], k=1)[0]
@@ -3022,7 +3215,7 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
         prize_text = f"🎉 Выпало: {reward:,} DC".replace(",", " ")
     else:
         gift_key = {15: 5, 25: 10, 50: 15, 100: 20}[reward]
-        gift_id = random.choice(REF_GIFT_IDS[gift_key])
+        gift_id = random.choice(GIFT_IDS[gift_key])
         try:
             await bot.send_gift(user_id=user_id, gift_id=gift_id)
             prize_text = f"🎁 Выпал подарок {reward}⭐\n✅ Подарок отправлен в личку!"
@@ -3052,10 +3245,6 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
     )
     await callback.answer()
 
-@router.callback_query(F.data == "case_open_karapuz")
-async def open_karapuz_case(callback: CallbackQuery, bot: Bot) -> None:
-    await open_case(callback, bot, "karapuz")
-
 @router.callback_query(F.data == "case_open_blood")
 async def open_blood_case(callback: CallbackQuery, bot: Bot) -> None:
     await open_case(callback, bot, "blood")
@@ -3067,6 +3256,18 @@ async def open_pantera_case(callback: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data == "case_open_spider_man")
 async def open_spider_man_case(callback: CallbackQuery, bot: Bot) -> None:
     await open_case(callback, bot, "spider_man")
+
+@router.callback_query(F.data == "case_open_school")
+async def open_school_case(callback: CallbackQuery, bot: Bot) -> None:
+    await open_case(callback, bot, "school")
+
+@router.callback_query(F.data == "case_open_student")
+async def open_student_case(callback: CallbackQuery, bot: Bot) -> None:
+    await open_case(callback, bot, "student")
+
+@router.callback_query(F.data == "case_open_excellent")
+async def open_excellent_case(callback: CallbackQuery, bot: Bot) -> None:
+    await open_case(callback, bot, "excellent")
 
 # =========================
 # GROUP — CASINO
@@ -3121,6 +3322,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     if s1 == s2 == s3:
         win = bet * 2
         await db.add_coins(user_id, win)
+        await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance, _ = await db.get_coins(user_id)
         await message.reply(
             f"🎰 {s1} {s2} {s3}\n\n"
@@ -3131,11 +3333,13 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
         )
         await send_game_log(bot, f"🎰 Слоты\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC")
     else:
+        boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
+        balance_after, _ = await db.get_coins(user_id)
         await message.reply(
             f"🎰 {s1} {s2} {s3}\n\n"
             f"❌ Не повезло!\n"
             f"💸 Ставка: {bet} DC\n"
-            f"🪙 Баланс: {balance_after} DC"
+            f"🪙 Баланс: {balance_after} DC{boss_note}"
         )
         await send_game_log(bot, f"🎰 Слоты\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC\n❌ Проигрыш\n🪙 Баланс: {balance_after} DC")
 
@@ -3194,6 +3398,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     if result_color == color:
         win = bet * 2
         await db.add_coins(user_id, win)
+        await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance, _ = await db.get_coins(user_id)
         await message.reply(
             f"🎡 Выпало: {result_emoji}\n\n"
@@ -3204,12 +3409,13 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         )
         await send_game_log(bot, f"🎡 Рулетка\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {chosen_emoji}\nВыпало: {result_emoji}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC")
     else:
+        boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         new_balance, _ = await db.get_coins(user_id)
         await message.reply(
             f"🎡 Выпало: {result_emoji}\n\n"
             f"❌ Не повезло!\n"
             f"💸 Ставка: {bet} DC на {chosen_emoji}\n"
-            f"🪙 Баланс: {new_balance} DC"
+            f"🪙 Баланс: {new_balance} DC{boss_note}"
         )
         await send_game_log(bot, f"🎡 Рулетка\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {chosen_emoji}\nВыпало: {result_emoji}\n❌ Проигрыш\n🪙 Баланс: {new_balance} DC")
 
@@ -3265,6 +3471,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
     if rolled == number:
         win = bet * 2
         await db.add_coins(user_id, win)
+        await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance, _ = await db.get_coins(user_id)
         await message.reply(
             f"🎲 Выпало: {rolled}\n\n"
@@ -3275,12 +3482,13 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
         )
         await send_game_log(bot, f"🎲 Кубик\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {number}\nВыпало: {rolled}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC")
     else:
+        boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         new_balance, _ = await db.get_coins(user_id)
         await message.reply(
             f"🎲 Выпало: {rolled}\n\n"
             f"❌ Не угадал! (ты выбрал {number})\n"
             f"💸 Ставка: {bet} DC\n"
-            f"🪙 Баланс: {new_balance} DC"
+            f"🪙 Баланс: {new_balance} DC{boss_note}"
         )
         await send_game_log(bot, f"🎲 Кубик\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {number}\nВыпало: {rolled}\n❌ Проигрыш\n🪙 Баланс: {new_balance} DC")
 
@@ -3350,6 +3558,7 @@ def mines_text(game: dict) -> str:
         text += f"\n💵 Выигрыш: x{multiplier:.2f} | {prize:,} DC".replace(",", " ")
     return text
 
+@serialized_game
 async def start_mines_game(message: Message) -> None:
     user_id = message.from_user.id
     if await db.is_banned(user_id):
@@ -3382,6 +3591,7 @@ async def start_mines_game(message: Message) -> None:
     casino_bet_cooldowns[user_id] = True
     game = {
         "game": "mines",
+        "token": secrets.token_hex(12),
         "bet": bet,
         "mines": set(random.sample(range(MINES_GRID_SIZE), MINES_COUNT)),
         "opened": set(),
@@ -3389,7 +3599,8 @@ async def start_mines_game(message: Message) -> None:
         "expires": time.time() + CASINO_TIMEOUT,
     }
     active_games[user_id] = game
-    await message.reply(mines_text(game), reply_markup=mines_keyboard(game))
+    sent = await message.reply(mines_text(game), reply_markup=mines_keyboard(game))
+    game["message_id"] = sent.message_id
 
 @router.message(Command("mines"))
 async def cmd_mines(message: Message) -> None:
@@ -3402,11 +3613,15 @@ async def cmd_mines_text(message: Message) -> None:
     await start_mines_game(message)
 
 @router.callback_query(F.data.startswith("mines_cell_"))
+@serialized_game
 async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
     game = active_games.get(user_id)
     if not game or game.get("game") != "mines":
         await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+    if callback.message.message_id != game.get("message_id") or callback.message.chat.id != game["chat_id"]:
+        await callback.answer("Это поле от другой игры.", show_alert=True)
         return
     try:
         cell = int(callback.data.removeprefix("mines_cell_"))
@@ -3419,9 +3634,10 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
 
     if cell in game["mines"]:
         active_games.pop(user_id, None)
+        boss_note = await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], False)
         balance, _ = await db.get_coins(user_id)
         await callback.message.edit_text(
-            "💣 Игра завершена!\n💵 Вы проиграли.",
+            "💣 Игра завершена!\n💵 Вы проиграли." + boss_note,
             reply_markup=mines_keyboard(game, reveal=True),
         )
         await send_game_log(
@@ -3433,10 +3649,12 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     game["opened"].add(cell)
+    await school_event.record(user_id, display_name(callback.from_user), f"safe:{game['token']}:{cell}", {"safe": 1})
     if len(game["opened"]) == MINES_GRID_SIZE - MINES_COUNT:
         prize = mines_prize(game["bet"], len(game["opened"]))
         active_games.pop(user_id, None)
         balance = await db.add_coins(user_id, prize)
+        await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
         await callback.message.edit_text(
             f"🏆 Поле очищено!\n💵 Выигрыш: x{mines_multiplier(len(game['opened'])):.2f} | {prize:,} DC\n🪙 Баланс: {balance:,} DC".replace(",", " "),
             reply_markup=mines_keyboard(game, reveal=True),
@@ -3447,11 +3665,15 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 @router.callback_query(F.data == "mines_cashout")
+@serialized_game
 async def mines_cashout(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
     game = active_games.get(user_id)
     if not game or game.get("game") != "mines":
         await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+    if callback.message.message_id != game.get("message_id") or callback.message.chat.id != game["chat_id"]:
+        await callback.answer("Это поле от другой игры.", show_alert=True)
         return
     safe_opened = len(game["opened"])
     if not safe_opened:
@@ -3460,6 +3682,7 @@ async def mines_cashout(callback: CallbackQuery, bot: Bot) -> None:
     prize = mines_prize(game["bet"], safe_opened)
     active_games.pop(user_id, None)
     balance = await db.add_coins(user_id, prize)
+    await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
     await callback.message.edit_text(
         f"✅ Вы забрали выигрыш!\n💵 Выигрыш: x{mines_multiplier(safe_opened):.2f} | {prize:,} DC\n🪙 Баланс: {balance:,} DC".replace(",", " "),
         reply_markup=mines_keyboard(game, reveal=True),
@@ -3578,7 +3801,7 @@ async def process_exchange_gift(callback: CallbackQuery, cost: int, gift_key: in
     if balance < cost:
         await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
         return
-    gift_ids = REF_GIFT_IDS.get(gift_key, [])
+    gift_ids = GIFT_IDS.get(gift_key, [])
     gift_id  = random.choice(gift_ids) if gift_ids else None
     if not gift_id:
         logger.error("No gift IDs configured for exchange gift key %s", gift_key)
@@ -3729,6 +3952,7 @@ def duel_keyboard(duel_id: str, bet: int) -> InlineKeyboardMarkup:
 
 
 @router.message(Command("duel"))
+@serialized_game
 async def cmd_duel(message: Message) -> None:
     if message.chat.id != MAIN_CHAT_ID or message.chat.type not in {"group", "supergroup"}:
         return
@@ -3835,6 +4059,7 @@ async def cmd_duel(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("duel_cancel:"))
+@serialized_game
 async def duel_cancel_callback(callback: CallbackQuery) -> None:
     duel_id = callback.data.removeprefix("duel_cancel:")
     duel = active_duels.get(duel_id)
@@ -3852,6 +4077,7 @@ async def duel_cancel_callback(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("duel_accept:"))
+@serialized_game
 async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
     duel_id = callback.data.removeprefix("duel_accept:")
     duel = active_duels.get(duel_id)
@@ -3917,6 +4143,10 @@ async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
     duel_cooldowns[challenger_id] = True
     duel_cooldowns[opponent_id] = True
     release_duel(duel_id)
+    for participant, participant_name in ((challenger_id, duel["challenger_name"]), (opponent_id, opponent_name)):
+        await school_event.record(participant, participant_name, f"duel:{duel_id}",
+            {"duels": 1, "duelwin": int(participant == winner_id), "games": 1,
+             "gamewin": int(participant == winner_id), "bets": bet})
     winner_name = duel["challenger_name"] if winner_id == challenger_id else opponent_name
     loser_name = opponent_name if winner_id == challenger_id else duel["challenger_name"]
     winner_balance = challenger_balance if winner_id == challenger_id else opponent_balance
@@ -3943,63 +4173,24 @@ async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
     )
     await callback.answer(f"🏆 Победил {winner_name}!")
 
-# =========================
-# NEW MEMBERS
-# =========================
-
-@router.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
-async def on_user_join(event: ChatMemberUpdated, bot: Bot) -> None:
-    if event.chat.id != MAIN_CHAT_ID:
-        return
-    member = event.new_chat_member.user
-    if member.is_bot:
-        return
-    if await db.is_already_referred(member.id):
-        return
-    invite_link = event.invite_link
-    if not invite_link:
-        return
-    link_str   = invite_link.invite_link
-    inviter_id = await db.get_owner_by_link(link_str)
-    # Все ссылки создаёт бот, поэтому invite_link.creator не является
-    # пригласившим пользователем. Для старых ссылок восстанавливаем ID
-    # из имени ref_<user_id>, иначе реферала не засчитываем никому.
-    if not inviter_id and invite_link.name and invite_link.name.startswith("ref_"):
-        try:
-            inviter_id = int(invite_link.name.removeprefix("ref_"))
-        except ValueError:
-            inviter_id = None
-    if not inviter_id:
-        logger.warning("Unknown referral invite link: %s", link_str)
-        return
-    if inviter_id == member.id:
-        return
-    await db.add_referral(member.id, inviter_id)
-    await send_log(bot,
-        f"🔗 Новый реферал\n\n"
-        f"👤 Пришёл: {display_name(member)} ({member.id})\n"
-        f"👥 Пригласил: {inviter_id}\n"
-        f"⏳ Нужно сообщений: {VALID_REF_MESSAGES}"
-    )
-
 # Обычные слова вместо команд со слешем. Этот обработчик расположен до
 # group_handler, поэтому команды не засчитываются как обычные сообщения.
 PRIVATE_PLAIN_COMMANDS = {
-    "start", "ref", "refstats", "say", "vip", "unvip", "viplist", "ban",
+    "start", "say", "vip", "unvip", "viplist", "ban",
     "unban", "banlist", "addmsgs", "removemsgs", "addday", "removeday",
     "addcoins", "removecoins", "createpromo", "deletepromo", "createcasepromo",
-    "promos", "addrefs", "removerefs", "balance", "popolnit", "sendgift",
+    "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "promo", "cases", "slots", "roulette", "dice", "mines", "admin",
 }
-GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "reftop", "cointop", "daytop", "bonus", "duel"}
+GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop", "bonus", "duel"}
 BOT_ARGUMENT_COMMANDS = {
-    "start", "ref", "say", "addrefs", "balance", "popolnit", "sendgift",
+    "start", "say", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
     "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "admin",
 }
 PLAIN_COMMAND_HANDLERS = {
-    "start": cmd_start, "help": cmd_help, "ref": cmd_ref, "refstats": cmd_refstats,
+    "start": cmd_start, "help": cmd_help,
     "say": cmd_say, "vip": cmd_vip, "unvip": cmd_unvip, "viplist": cmd_viplist,
     "ban": cmd_ban, "unban": cmd_unban, "banlist": cmd_banlist,
     "addmsgs": cmd_addmsgs, "removemsgs": cmd_removemsgs,
@@ -4007,13 +4198,12 @@ PLAIN_COMMAND_HANDLERS = {
     "addcoins": cmd_addcoins, "removecoins": cmd_removecoins,
     "createpromo": cmd_createpromo, "deletepromo": cmd_deletepromo,
     "createcasepromo": cmd_createcasepromo, "promos": cmd_promos,
-    "addrefs": cmd_addrefs, "removerefs": cmd_removerefs,
     "balance": cmd_balance, "popolnit": cmd_popolnit, "sendgift": cmd_sendgift,
     "pending": cmd_pending, "deliver": cmd_deliver, "deletepending": cmd_deletepending,
     "premiumorders": cmd_premiumorders,
     "premiumdone": cmd_premiumdone, "premiumrefund": cmd_premiumrefund,
     "stats": cmd_stats, "top": cmd_top, "winstop": cmd_winstop,
-    "reftop": cmd_reftop, "cointop": cmd_cointop, "coins": cmd_coins,
+    "cointop": cmd_cointop, "coins": cmd_coins,
     "promo": cmd_promo, "transfer": cmd_transfer, "daytop": cmd_daytop,
     "bonus": cmd_bonus, "cases": cmd_cases, "slots": cmd_slots,
     "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines,
@@ -4085,23 +4275,10 @@ async def group_handler(message: Message, bot: Bot) -> None:
     is_vip = await db.is_vip(user_id)
 
     # Монеты за сообщение
+    if not message.sender_chat and message.from_user and not message.from_user.is_bot:
+        await school_event.record(user_id, name, f"message:{message.chat.id}:{message.message_id}", {"messages": 1})
     coins_earned = COINS_VIP_PER_MSG if is_vip else COINS_PER_MSG
     await db.add_coins(user_id, coins_earned)
-
-    # REF VALIDATION
-    ref_data = await db.get_referral(user_id)
-    if ref_data:
-        inviter_id, valid, _ = ref_data
-        if not valid:
-            new_ref_count = await db.increment_ref_messages(user_id)
-            if new_ref_count % 5 == 0 and new_ref_count < VALID_REF_MESSAGES:
-                try:
-                    await bot.send_message(inviter_id, f"⏳ Твой реферал написал {new_ref_count}/{VALID_REF_MESSAGES} сообщений")
-                except Exception:
-                    pass
-            if new_ref_count >= VALID_REF_MESSAGES:
-                await db.validate_referral(user_id)
-                await reward_inviter(bot, inviter_id)
 
     # WIN SYSTEM
     msg_step = 1
@@ -4171,6 +4348,7 @@ async def main() -> None:
     if not TOKEN:
         raise ValueError("BOT_TOKEN не задан в .env")
     await db.init()
+    await school_event.init()
     await load_runtime_settings()
     bot = Bot(token=TOKEN)
     dp  = Dispatcher()
@@ -4178,6 +4356,7 @@ async def main() -> None:
     asyncio.create_task(daily_reset_task(bot))
     asyncio.create_task(casino_timeout_checker(bot))
     asyncio.create_task(duel_timeout_checker(bot))
+    asyncio.create_task(school_notifications(bot))
     logger.info("Бот запущен")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
