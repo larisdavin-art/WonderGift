@@ -43,6 +43,9 @@ COOLDOWN_SECONDS   = 1
 START_CHANCE       = 0.1
 STEP               = 0.002
 MAX_CHANCE         = 100.0
+# Розыгрыш подарка за общение: диапазон 0..2000 вдвое реже прежнего 0..1000.
+# Накопленный и купленный шанс игроков при этом сохраняется.
+GIFT_WIN_ROLL_MAX  = 2000.0
 BONUS_COOLDOWN     = 43200
 
 # D-COINS
@@ -978,6 +981,10 @@ async def save_case_chances(case_id: str) -> None:
 
 def display_name(user) -> str:
     return user.first_name
+
+
+def gift_roll_wins(chance: float) -> bool:
+    return chance >= MAX_CHANCE or random.uniform(0, GIFT_WIN_ROLL_MAX) <= chance
 
 
 async def send_log(bot: Bot, text: str) -> None:
@@ -4287,7 +4294,7 @@ async def group_handler(message: Message, bot: Bot) -> None:
     if msg_count < 150:
         is_win = False
     else:
-        is_win = chance >= MAX_CHANCE or random.uniform(0, 1000) <= chance
+        is_win = gift_roll_wins(chance)
 
     if is_win:
         await db.add_win(user_id, message.chat.id, name, chance)
