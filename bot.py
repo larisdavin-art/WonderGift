@@ -1079,6 +1079,16 @@ async def publish_promo(bot: Bot, text: str) -> bool:
         return False
 
 
+HIDDEN_PROMO_FLAGS = {"скрытый", "скрыто", "hidden", "private"}
+
+
+def parse_hidden_promo_args(text: str) -> tuple[list[str], bool]:
+    """Убирает необязательный флаг скрытого промокода из конца команды."""
+    args = text.split()
+    hidden = bool(args and args[-1].lower() in HIDDEN_PROMO_FLAGS)
+    return (args[:-1] if hidden else args), hidden
+
+
 async def send_bot_gift(bot: Bot, user_id: int, gift_id: str) -> str:
     await bot.send_gift(user_id=user_id, gift_id=gift_id)
     return "бот"
@@ -2220,9 +2230,13 @@ async def cmd_removecoins(message: Message) -> None:
 async def cmd_createpromo(message: Message, bot: Bot) -> None:
     if message.from_user.id != ADMIN_ID:
         return
-    args = message.text.split()
+    args, hidden = parse_hidden_promo_args(message.text)
     if len(args) not in (3, 4):
-        await message.answer("Использование: /createpromo КОД награда_DC [лимит]\nЛимит не указывай для безлимитного промокода.")
+        await message.answer(
+            "Использование: /createpromo КОД награда_DC [лимит] [скрытый]\n"
+            "Лимит не указывай для безлимитного промокода.\n"
+            "Флаг «скрытый» отключает публикацию в канале."
+        )
         return
     code = args[1].upper()
     if not 3 <= len(code) <= 32 or not all(char.isalnum() or char in "_-" for char in code):
@@ -2238,8 +2252,12 @@ async def cmd_createpromo(message: Message, bot: Bot) -> None:
         await message.answer("❌ Не удалось создать промокод: проверь значения или выбери другой код.")
         return
     limit_text = str(max_uses) if max_uses is not None else "без лимита"
-    await message.answer(f"✅ Промокод {code} создан.\n🎁 Награда: {reward} DC\n👥 Активаций: {limit_text}")
-    if not await publish_promo(
+    visibility_text = "\n🔒 Скрытый: в канал не опубликован" if hidden else ""
+    await message.answer(
+        f"✅ Промокод {code} создан.\n🎁 Награда: {reward} DC\n"
+        f"👥 Активаций: {limit_text}{visibility_text}"
+    )
+    if not hidden and not await publish_promo(
         bot,
         f"🎁 Новый промокод!\n\n"
         f"🔑 Код: <code>{code}</code>\n"
@@ -2266,9 +2284,12 @@ async def cmd_deletepromo(message: Message) -> None:
 async def cmd_createcasepromo(message: Message, bot: Bot) -> None:
     if message.from_user.id != ADMIN_ID:
         return
-    args = message.text.split()
+    args, hidden = parse_hidden_promo_args(message.text)
     if len(args) not in (3, 4, 5):
-        await message.answer("Использование: /createcasepromo КОД КЕЙС [ключей] [лимит]\nПример: /createcasepromo BLOODFREE blood 1 100")
+        await message.answer(
+            "Использование: /createcasepromo КОД КЕЙС [ключей] [лимит] [скрытый]\n"
+            "Пример: /createcasepromo BLOODFREE blood 1 100 скрытый"
+        )
         return
     code = args[1].upper()
     case_id = args[2].lower()
@@ -2285,8 +2306,12 @@ async def cmd_createcasepromo(message: Message, bot: Bot) -> None:
         await message.answer("❌ Не удалось создать промокод: проверь кейс, значения или код.")
         return
     limit_text = str(max_uses) if max_uses is not None else "без лимита"
-    await message.answer(f"✅ Промокод {code} создан.\n🎟 Кейс: {CASES[case_id]['title']} × {case_count}\n👥 Активаций: {limit_text}")
-    if not await publish_promo(
+    visibility_text = "\n🔒 Скрытый: в канал не опубликован" if hidden else ""
+    await message.answer(
+        f"✅ Промокод {code} создан.\n🎟 Кейс: {CASES[case_id]['title']} × {case_count}\n"
+        f"👥 Активаций: {limit_text}{visibility_text}"
+    )
+    if not hidden and not await publish_promo(
         bot,
         f"🎁 Новый промокод!\n\n"
         f"🔑 Код: <code>{code}</code>\n"
@@ -2771,7 +2796,10 @@ async def admin_promos_callback(callback: CallbackQuery) -> None:
                 buttons.append([InlineKeyboardButton(text=f"🗑 {code}", callback_data=callback_data)])
     else:
         text += "Промокодов нет."
-    text += "\nСоздать: createpromo КОД DC ЛИМИТ\nКейс: createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ"
+    text += (
+        "\nСоздать: createpromo КОД DC ЛИМИТ [скрытый]\n"
+        "Кейс: createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ [скрытый]"
+    )
     buttons.append([InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")])
     await callback.message.edit_text(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -3097,8 +3125,8 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
         "addcoins ID СУММА / removecoins ID СУММА\n"
         "addmsgs ID КОЛ-ВО / removemsgs ID КОЛ-ВО\n"
         "vip ID / unvip ID / ban ID ПРИЧИНА / unban ID\n"
-        "createpromo КОД DC ЛИМИТ\n"
-        "createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ\n"
+        "createpromo КОД DC [ЛИМИТ] [скрытый]\n"
+        "createcasepromo КОД КЕЙС [КЛЮЧИ] [ЛИМИТ] [скрытый]\n"
         "promos / pending / premiumorders\n"
         "say ТЕКСТ — сообщение в основную группу\n"
         "раздать СУММА — начислить DC всем пользователям бота\n"
