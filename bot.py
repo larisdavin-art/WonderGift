@@ -1079,18 +1079,15 @@ async def publish_promo(bot: Bot, text: str) -> bool:
         return False
 
 
+async def send_bot_gift(bot: Bot, user_id: int, gift_id: str) -> str:
+    await bot.send_gift(user_id=user_id, gift_id=gift_id)
+    return "бот"
+
+
 async def send_gift_safe(bot: Bot, user_id: int, user_name: str, gift_id: str, reason: str) -> None:
     try:
-        star_balance = await bot.get_my_star_balance()
-        cost_map = {
-            EXCHANGE_GIFT_15:  15,
-            EXCHANGE_GIFT_25:  25,
-            EXCHANGE_GIFT_50:  50,
-            EXCHANGE_GIFT_100: 100,
-        }
-        cost = 15
-        await bot.send_gift(user_id=user_id, gift_id=gift_id)
-        await send_log(bot, f"🎁 Подарок отправлен\n\n{user_name} ({user_id})\n📝 {reason}\n💫 Баланс: {star_balance.amount}⭐")
+        sender = await send_bot_gift(bot, user_id, gift_id)
+        await send_log(bot, f"🎁 Подарок отправлен\n\n{user_name} ({user_id})\n📝 {reason}\n👤 Отправитель: {sender}")
     except Exception as e:
         await db.add_pending_gift(user_id, user_name, gift_id, f"{reason} — ошибка: {e}")
         await bot.send_message(ADMIN_ID, f"❌ Ошибка отправки подарка\n\n👤 {user_name} ({user_id})\n📝 {reason}\n📛 {e}\nДобавлен в /pending")
@@ -1592,7 +1589,7 @@ async def deliver_school_gifts(bot: Bot, sid: int, uid: int) -> tuple[int, int]:
         for prize in prizes:
             try:
                 gift_id = random.choice(GIFT_IDS[gift_sizes[prize["amount"]]])
-                await bot.send_gift(user_id=uid, gift_id=gift_id)
+                await send_bot_gift(bot, uid, gift_id)
                 async with school_event.transaction() as c:
                     await c.execute(
                         "UPDATE school_prizes SET done=1 WHERE id=? AND done=0",
@@ -1900,6 +1897,13 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     if await db.is_banned(message.from_user.id):
         await message.answer(BAN_MESSAGE)
         return
+    if message.from_user.username:
+        await db.set_username(
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.id,
+            display_name(message.from_user),
+        )
     await db.register_bot_user(message.from_user.id, display_name(message.from_user))
     if not await is_channel_subscriber(bot, message.from_user.id):
         await send_subscription_prompt(message)
@@ -1926,7 +1930,7 @@ async def send_help(message: Message) -> None:
         "📖 Как играть\n\n"
         "1️⃣ Подпишись на канал и нажми «Проверить подписку».\n"
         "2️⃣ Пиши сообщения в основной группе — за них начисляются DC.\n"
-        "3️⃣ Забирай ежедневный бонус: бонус.\n\n"
+        "3️⃣ Забирай ежедневный бонус в личке или основной группе: бонус.\n\n"
         "🎰 Игры — только в личке с ботом\n"
         "• слоты 50\n"
         "• рулетка красное 50\n"
@@ -2392,9 +2396,8 @@ async def cmd_sendgift(message: Message, bot: Bot) -> None:
         await message.answer("❌ Укажи числовой ID и gift_id.")
         return
     try:
-        star_balance = await bot.get_my_star_balance()
-        await bot.send_gift(user_id=user_id, gift_id=gift_id)
-        await send_log(bot, f"🎁 Ручная выдача\n\n👤 {user_id}\n📦 {gift_id}\n💫 {star_balance.amount}⭐")
+        sender = await send_bot_gift(bot, user_id, gift_id)
+        await send_log(bot, f"🎁 Ручная выдача\n\n👤 {user_id}\n📦 {gift_id}\nОтправитель: {sender}")
         await message.answer(f"✅ Подарок отправлен!\n👤 {user_id}\n📦 {gift_id}")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
@@ -2409,7 +2412,8 @@ async def cmd_pending(message: Message, bot: Bot) -> None:
         return
     import datetime as dt
     star_balance = await bot.get_my_star_balance()
-    text = f"📋 Невыданные подарки ({len(gifts)}):\n💫 Баланс: {star_balance.amount}⭐\n\n"
+    balance_text = f"{star_balance.amount}⭐"
+    text = f"📋 Невыданные подарки ({len(gifts)}):\n💫 Отправитель/баланс: {balance_text}\n\n"
     for g_id, uid, user_name, gift_id, reason, created_at in gifts:
         date = dt.datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
         text += (
@@ -2439,11 +2443,10 @@ async def cmd_deliver(message: Message, bot: Bot) -> None:
         return
     _, user_id, user_name, gift_id, reason, _ = gift
     try:
-        star_balance = await bot.get_my_star_balance()
-        await bot.send_gift(user_id=user_id, gift_id=gift_id)
+        sender = await send_bot_gift(bot, user_id, gift_id)
         await db.remove_pending_gift(gift_db_id)
-        await send_log(bot, f"🎁 Отложенный подарок выдан\n\n{user_name} ({user_id})\n💫 {star_balance.amount}⭐")
-        await message.answer(f"✅ Подарок выдан!\n👤 {user_name} ({user_id})\n💫 Баланс: {star_balance.amount}⭐")
+        await send_log(bot, f"🎁 Отложенный подарок выдан\n\n{user_name} ({user_id})\nОтправитель: {sender}")
+        await message.answer(f"✅ Подарок выдан!\n👤 {user_name} ({user_id})\nОтправитель: {sender}")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}\n\nПополни баланс через /popolnit")
 
@@ -2656,7 +2659,7 @@ async def admin_deliver_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
     _, user_id, user_name, telegram_gift_id, _, _ = gift
     try:
-        await bot.send_gift(user_id=user_id, gift_id=telegram_gift_id)
+        await send_bot_gift(bot, user_id, telegram_gift_id)
         await db.remove_pending_gift(gift_db_id)
         await send_log(bot, f"🎁 Подарок #{gift_db_id} выдан через админ-панель\n{user_name} ({user_id})")
         await render_admin_pending(callback, bot, f"✅ Подарок #{gift_db_id} выдан.")
@@ -3332,14 +3335,17 @@ async def cmd_daytop(message: Message) -> None:
 
 @router.message(Command("bonus"))
 async def cmd_bonus(message: Message) -> None:
-    if message.chat.id != MAIN_CHAT_ID:
+    # Бонус доступен и в личке с ботом, и в основном чате канала.
+    # Статистика шанса всегда хранится за MAIN_CHAT_ID, чтобы нельзя было
+    # повторно забрать шанс-бонус, переключаясь между личкой и группой.
+    if message.chat.type != "private" and message.chat.id != MAIN_CHAT_ID:
         return
     if await db.is_banned(message.from_user.id):
         await message.reply(BAN_MESSAGE)
         return
     user_id = message.from_user.id
     name    = display_name(message.from_user)
-    chance, msg_count, last_bonus = await db.get_user(user_id, message.chat.id)
+    chance, msg_count, last_bonus = await db.get_user(user_id, MAIN_CHAT_ID)
     balance, last_coin_bonus = await db.get_coins(user_id)
     now = time.time()
     is_vip = await db.is_vip(user_id)
@@ -3350,7 +3356,7 @@ async def cmd_bonus(message: Message) -> None:
     if now - last_bonus >= BONUS_COOLDOWN:
         bonus_amount = round(random.uniform(0.05, 0.20), 3)
         new_chance   = min(round(chance + bonus_amount, 3), MAX_CHANCE)
-        await db.update_user(user_id, message.chat.id, name, new_chance, msg_count, now)
+        await db.update_user(user_id, MAIN_CHAT_ID, name, new_chance, msg_count, now)
         chance_text = f"📈 Шанс: +{bonus_amount:.3f}% → {new_chance:.3f}%"
     else:
         left = BONUS_COOLDOWN - (now - last_bonus)
@@ -3461,7 +3467,7 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
         gift_key = {15: 5, 25: 10, 50: 15, 100: 20}[reward]
         gift_id = random.choice(GIFT_IDS[gift_key])
         try:
-            await bot.send_gift(user_id=user_id, gift_id=gift_id)
+            await send_bot_gift(bot, user_id, gift_id)
             prize_text = f"🎁 Выпал подарок {reward}⭐\n✅ Подарок отправлен в личку!"
         except Exception as e:
             await db.add_pending_gift(user_id, await db.get_user_name(user_id), gift_id, f"кейс {case['title']}: {e}")
@@ -4094,7 +4100,7 @@ async def process_exchange_gift(callback: CallbackQuery, cost: int, gift_key: in
         return
 
     try:
-        await bot.send_gift(user_id=user_id, gift_id=gift_id)
+        await send_bot_gift(bot, user_id, gift_id)
     except Exception as e:
         logger.warning("Exchange gift failed: %s", e)
         await db.add_pending_gift(user_id, name, gift_id, f"{pending_reason} — ошибка: {e}")
@@ -4427,7 +4433,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "promo", "cases", "slots", "roulette", "dice", "mines", "admin", "broadcast",
 }
-GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop", "bonus", "duel"}
+GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop", "duel"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "say", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
@@ -4464,6 +4470,8 @@ async def plain_command_handler(message: Message, bot: Bot) -> None:
     if command in PRIVATE_PLAIN_COMMANDS and message.chat.type != "private":
         return
     if command in GROUP_PLAIN_COMMANDS and message.chat.id != MAIN_CHAT_ID:
+        return
+    if command == "bonus" and message.chat.type != "private" and message.chat.id != MAIN_CHAT_ID:
         return
 
     command_message = message.model_copy(update={"text": "/" + command + (" " + " ".join(args) if args else "")})
@@ -4545,27 +4553,14 @@ async def group_handler(message: Message, bot: Bot) -> None:
         await bot.send_message(ADMIN_ID, f"🏆 Новый победитель\n\n{name} ({user_id})\nШанс: {chance:.3f}%")
 
         try:
-            star_balance = await bot.get_my_star_balance()
-            if star_balance.amount < 15:
-                await db.add_pending_gift(user_id, name, WIN_GIFT_IDS[0], "победа")
-                await send_log(bot, f"⚠️ Недостаточно звёзд!\n\nБаланс: {star_balance.amount}⭐\n{name} ({user_id})\nДобавлен в /pending")
-                await bot.send_message(ADMIN_ID,
-                    f"⚠️ Недостаточно звёзд!\n\n💫 {star_balance.amount}⭐\n👤 {name} ({user_id})\nДобавлен в /pending"
-                )
-            else:
-                try:
-                    await bot.send_gift(user_id=user_id, gift_id=random.choice(WIN_GIFT_IDS))
-                    await send_log(bot, f"🎁 Подарок отправлен\n\n{name} ({user_id})\n💫 {star_balance.amount - 15}⭐")
-                    await bot.send_message(ADMIN_ID, f"✅ Подарок отправлен!\n\n👤 {name} ({user_id})\n💫 {star_balance.amount - 15}⭐")
-                except Exception as e:
-                    error_text = str(e)
-                    await db.add_pending_gift(user_id, name, WIN_GIFT_IDS[0], f"ошибка: {error_text}")
-                    await send_log(bot, f"❌ Ошибка подарка\n\n{name} ({user_id})\n{error_text}")
-                    await bot.send_message(ADMIN_ID, f"❌ Ошибка подарка\n\n👤 {name} ({user_id})\n📛 {error_text}\nДобавлен в /pending")
+            sender = await send_bot_gift(bot, user_id, random.choice(WIN_GIFT_IDS))
+            await send_log(bot, f"🎁 Подарок отправлен\n\n{name} ({user_id})\nОтправитель: {sender}")
+            await bot.send_message(ADMIN_ID, f"✅ Подарок отправлен!\n\n👤 {name} ({user_id})\nОтправитель: {sender}")
         except Exception as e:
-            logger.warning("get_my_star_balance failed: %s", e)
-            await db.add_pending_gift(user_id, name, WIN_GIFT_IDS[0], "не удалось проверить баланс")
-            await bot.send_message(ADMIN_ID, f"⚠️ Не удалось проверить баланс\n\n👤 {name} ({user_id})\nДобавлен в /pending")
+            error_text = str(e)
+            await db.add_pending_gift(user_id, name, WIN_GIFT_IDS[0], f"ошибка: {error_text}")
+            await send_log(bot, f"❌ Ошибка подарка\n\n{name} ({user_id})\n{error_text}")
+            await bot.send_message(ADMIN_ID, f"❌ Ошибка подарка\n\n👤 {name} ({user_id})\n📛 {error_text}\nДобавлен в /pending")
 
         await db.update_user(user_id, message.chat.id, name, START_CHANCE, 0, last_bonus)
     else:
