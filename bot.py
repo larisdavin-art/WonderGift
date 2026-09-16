@@ -317,6 +317,30 @@ class Database:
                 )
             """)
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_users (
+                    user_id    INTEGER PRIMARY KEY,
+                    user_name  TEXT,
+                    started_at REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bonus_broadcasts (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    amount     INTEGER NOT NULL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bonus_deliveries (
+                    broadcast_id INTEGER NOT NULL,
+                    user_id      INTEGER NOT NULL,
+                    status       INTEGER NOT NULL DEFAULT 0,
+                    attempts     INTEGER NOT NULL DEFAULT 0,
+                    error        TEXT,
+                    PRIMARY KEY (broadcast_id, user_id)
+                )
+            """)
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key        TEXT PRIMARY KEY,
                     value      REAL NOT NULL,
@@ -339,6 +363,15 @@ class Database:
             await db.execute("DELETE FROM promo_codes WHERE case_id='karapuz'")
             await db.execute("DELETE FROM case_keys WHERE case_id='karapuz'")
             await db.execute("DELETE FROM app_settings WHERE key LIKE 'case_chance:karapuz:%'")
+            # До появления bot_users точного списка /start не было. Один раз переносим
+            # известных владельцев баланса; дальше новые пользователи пишутся по /start.
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_users(user_id,user_name,started_at) "
+                "SELECT c.user_id, COALESCE((SELECT u.user_name FROM user_stats u "
+                "WHERE u.user_id=c.user_id ORDER BY u.chat_id LIMIT 1), CAST(c.user_id AS TEXT)), ? "
+                "FROM coins c",
+                (time.time(),),
+            )
             await db.commit()
 
     # --------------------------------------------------
@@ -842,6 +875,42 @@ class Database:
                 row = await cur.fetchone()
         return row[0] if row else 0
 
+    async def register_bot_user(self, user_id: int, user_name: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO bot_users(user_id,user_name,started_at) VALUES (?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name",
+                (user_id, user_name, time.time()),
+            )
+            await db.commit()
+
+    async def create_bonus_broadcast(self, amount: int) -> tuple[int, int]:
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute("SELECT user_id FROM bot_users ORDER BY user_id") as cur:
+                    users = [row[0] for row in await cur.fetchall()]
+                cur = await db.execute(
+                    "INSERT INTO bonus_broadcasts(amount,created_at) VALUES (?,?)",
+                    (amount, time.time()),
+                )
+                broadcast_id = cur.lastrowid
+                for user_id in users:
+                    await db.execute(
+                        "INSERT INTO coins(user_id,balance) VALUES (?,?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET balance=balance+?",
+                        (user_id, COINS_START + amount, amount),
+                    )
+                    await db.execute(
+                        "INSERT INTO bonus_deliveries(broadcast_id,user_id) VALUES (?,?)",
+                        (broadcast_id, user_id),
+                    )
+                await db.commit()
+                return broadcast_id, len(users)
+            except Exception:
+                await db.rollback()
+                raise
+
     async def open_case(self, user_id: int, case_id: str, price: int | None, key_only: bool = False) -> str:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -1107,6 +1176,7 @@ from functools import wraps
 
 # Serialize game actions that share in-memory state across awaited DB operations.
 game_action_lock = asyncio.Lock()
+school_prize_delivery_lock = asyncio.Lock()
 
 
 def serialized_game(function):
@@ -1182,10 +1252,14 @@ class SchoolEvent:
                 "CREATE TABLE IF NOT EXISTS school_days (season INTEGER, uid INTEGER, day TEXT, streak INTEGER, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day))",
                 "CREATE TABLE IF NOT EXISTS school_claims (season INTEGER, uid INTEGER, prize TEXT, PRIMARY KEY(season,uid,prize))",
                 "CREATE TABLE IF NOT EXISTS school_actions (season INTEGER, uid INTEGER, token TEXT, PRIMARY KEY(season,uid,token))",
-                "CREATE TABLE IF NOT EXISTS school_prizes (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, uid INTEGER, reason TEXT, kind TEXT, amount INTEGER, done INTEGER DEFAULT 0, UNIQUE(season,uid,reason,kind))",
+                "CREATE TABLE IF NOT EXISTS school_prizes (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, uid INTEGER, reason TEXT, kind TEXT, amount INTEGER, done INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, UNIQUE(season,uid,reason,kind))",
                 "CREATE TABLE IF NOT EXISTS school_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, tag TEXT, text TEXT, sent INTEGER DEFAULT 0, UNIQUE(season,tag))",
             ):
                 await c.execute(sql)
+            async with c.execute("PRAGMA table_info(school_prizes)") as cur:
+                prize_columns = {row[1] for row in await cur.fetchall()}
+            if "attempts" not in prize_columns:
+                await c.execute("ALTER TABLE school_prizes ADD COLUMN attempts INTEGER DEFAULT 0")
 
     async def current(self, c, now=None, active=True):
         row = await self.one(c, "SELECT * FROM school_seasons ORDER BY id DESC LIMIT 1")
@@ -1329,16 +1403,37 @@ class SchoolEvent:
                     rewards.append(("excellent", 1))
                 await self.reward(c, sid, uid, "Серия квестов", rewards)
                 return "✅ +3 000 DC" + (" и 🔑 Кейс отличника за 5 дней подряд!" if row["streak"] == 5 else "")
-            if category == "level":
-                level = int(value)
+            if category in {"level", "levels"}:
                 player = await self.one(c, "SELECT knowledge FROM school_players WHERE season=? AND uid=?", (sid, uid))
+                if category == "levels":
+                    max_level = min(50, player[0] // 100)
+                    received = []
+                    received_levels = []
+                    for level in range(1, max_level + 1):
+                        cur = await c.execute("INSERT OR IGNORE INTO school_claims(season,uid,prize) VALUES (?,?,?)", (sid, uid, f"level:{level}"))
+                        if cur.rowcount == 1:
+                            await self.reward(c, sid, uid, f"Уровень {level}", PATH_REWARDS[level])
+                            received.extend(PATH_REWARDS[level])
+                            received_levels.append(level)
+                    if not received:
+                        return "Все доступные награды уже получены."
+                    totals = {}
+                    real_prizes = []
+                    for kind, amount in received:
+                        if kind in {"gift", "nft", "premium"}:
+                            real_prizes.append((kind, amount))
+                        else:
+                            totals[kind] = totals.get(kind, 0) + amount
+                    summary = event_reward_text(list(totals.items()) + real_prizes)
+                    return f"✅ Получено уровней: {len(received_levels)}. Начислено: {summary}"
+                level = int(value)
                 if level not in PATH_REWARDS or player[0] < level * 100:
                     return "Этот уровень ещё не достигнут."
                 cur = await c.execute("INSERT OR IGNORE INTO school_claims(season,uid,prize) VALUES (?,?,?)", (sid, uid, f"level:{level}"))
                 if cur.rowcount != 1:
                     return "Награда уже получена."
                 await self.reward(c, sid, uid, f"Уровень {level}", PATH_REWARDS[level])
-                return "✅ Награда получена. Подарки переданы на выдачу администратору."
+                return f"✅ Уровень {level}: {event_reward_text(PATH_REWARDS[level])}"
             return "Неизвестная награда."
 
 
@@ -1361,6 +1456,7 @@ def event_navigation():
     return [
         [InlineKeyboardButton(text="📚 Босс", callback_data="school:boss"), InlineKeyboardButton(text="🏆 Топ по урону", callback_data="school:top")],
         [InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"), InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0")],
+        [InlineKeyboardButton(text="🏅 Топ-10 призового пути", callback_data="school:path_top")],
     ]
 
 
@@ -1397,6 +1493,29 @@ async def event_page(uid, name, page):
                 buttons.append([InlineKeyboardButton(text="🎁 Бонус за все квесты", callback_data=f"scd:{sid}:{uid}:{day}")])
             buttons.append([InlineKeyboardButton(text="🔄 Обновить задания", callback_data="school:quests")])
             text = "\n".join(lines) + footer
+        elif page == "path_top":
+            async with c.execute(
+                "SELECT uid,name,knowledge FROM school_players WHERE season=? AND knowledge>0 "
+                "ORDER BY knowledge DESC,uid LIMIT 10",
+                (sid,),
+            ) as cur:
+                leaders = await cur.fetchall()
+            async with c.execute(
+                "SELECT uid FROM school_players WHERE season=? AND knowledge>0 ORDER BY knowledge DESC,uid",
+                (sid,),
+            ) as cur:
+                all_ranked = await cur.fetchall()
+            rank = next((index for index, row in enumerate(all_ranked, 1) if row["uid"] == uid), None)
+            lines = ["🏅 Топ-10 призового пути", ""]
+            lines.extend(
+                f"{index}. {row['name']} — {row['knowledge']:,} 📖 · уровень {min(50, row['knowledge'] // 100)}"
+                for index, row in enumerate(leaders, 1)
+            )
+            if not leaders:
+                lines.append("Пока никто не получил очки знаний.")
+            lines.append(f"\nТвоё место: {rank or '—'} · {knowledge:,} 📖")
+            text = "\n".join(lines) + footer
+            buttons.append([InlineKeyboardButton(text="🔄 Обновить топ", callback_data="school:path_top")])
         elif page.startswith("path"):
             try:
                 offset = max(0, min(4, int(page.split(":")[1])))
@@ -1410,6 +1529,8 @@ async def event_page(uid, name, page):
                 lines.append(f"{status} {level}. {event_reward_text(PATH_REWARDS[level])}")
                 if active and status == "🎁":
                     buttons.append([InlineKeyboardButton(text=f"Забрать уровень {level}", callback_data=f"scl:{sid}:{uid}:{level}")])
+            if active and any(knowledge >= level * 100 and f"level:{level}" not in claimed for level in PATH_REWARDS):
+                buttons.insert(0, [InlineKeyboardButton(text="🎁 Забрать все доступные награды", callback_data=f"scla:{sid}:{uid}:{offset}")])
             buttons.append([InlineKeyboardButton(text=str(i * 10 + 1) + "–" + str(i * 10 + 10), callback_data=f"school:path:{i}") for i in range(5)])
             text = "\n".join(lines) + footer
         else:
@@ -1456,6 +1577,39 @@ async def school_edit(callback, page):
             raise
 
 
+async def deliver_school_gifts(bot: Bot, sid: int, uid: int) -> tuple[int, int]:
+    """Send claimed path gifts immediately; failed gifts remain in the admin queue."""
+    sent = failed = 0
+    async with school_prize_delivery_lock:
+        async with school_event.transaction() as c:
+            async with c.execute(
+                "SELECT id,amount FROM school_prizes "
+                "WHERE season=? AND uid=? AND kind='gift' AND done=0 AND attempts<3 ORDER BY id",
+                (sid, uid),
+            ) as cur:
+                prizes = await cur.fetchall()
+        gift_sizes = {15: 5, 25: 10, 50: 15, 100: 20}
+        for prize in prizes:
+            try:
+                gift_id = random.choice(GIFT_IDS[gift_sizes[prize["amount"]]])
+                await bot.send_gift(user_id=uid, gift_id=gift_id)
+                async with school_event.transaction() as c:
+                    await c.execute(
+                        "UPDATE school_prizes SET done=1 WHERE id=? AND done=0",
+                        (prize["id"],),
+                    )
+                sent += 1
+            except Exception as error:
+                failed += 1
+                async with school_event.transaction() as c:
+                    await c.execute(
+                        "UPDATE school_prizes SET attempts=attempts+1 WHERE id=? AND done=0",
+                        (prize["id"],),
+                    )
+                logger.warning("Automatic school gift failed for %s: %s", uid, error)
+    return sent, failed
+
+
 @router.callback_query(F.data.startswith("school:"))
 async def school_callback(callback: CallbackQuery):
     if await db.is_banned(callback.from_user.id):
@@ -1465,8 +1619,8 @@ async def school_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("scq:") | F.data.startswith("scd:") | F.data.startswith("scl:"))
-async def school_claim_callback(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("scq:") | F.data.startswith("scd:") | F.data.startswith("scl:") | F.data.startswith("scla:"))
+async def school_claim_callback(callback: CallbackQuery, bot: Bot):
     if await db.is_banned(callback.from_user.id):
         await callback.answer(BAN_MESSAGE, show_alert=True)
         return
@@ -1475,13 +1629,25 @@ async def school_claim_callback(callback: CallbackQuery):
         if int(owner) != callback.from_user.id:
             await callback.answer("Это награда другого игрока.", show_alert=True)
             return
-        category = {"scq": "quest", "scd": "day", "scl": "level"}[kind]
+        category = {"scq": "quest", "scd": "day", "scl": "level", "scla": "levels"}[kind]
         result = await school_event.claim(int(sid), int(owner), display_name(callback.from_user), category, value)
+        if kind in {"scl", "scla"}:
+            sent, failed = await deliver_school_gifts(bot, int(sid), int(owner))
+            if sent:
+                result += f" Подарков отправлено: {sent}."
+            if failed:
+                result += f" Не удалось отправить: {failed}; оставлено в очереди админу."
     except (ValueError, KeyError):
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
     await callback.answer(result[:190], show_alert=True)
-    await school_edit(callback, f"path:{(int(value)-1)//10}" if kind == "scl" else "quests")
+    if kind == "scl":
+        page = f"path:{(int(value)-1)//10}"
+    elif kind == "scla":
+        page = f"path:{max(0, min(4, int(value)))}"
+    else:
+        page = "quests"
+    await school_edit(callback, page)
 
 
 async def school_admin_page(callback, page=0):
@@ -1558,9 +1724,52 @@ async def school_notifications(bot):
                 await bot.send_message(MAIN_CHAT_ID, row["text"])
                 async with school_event.transaction() as c:
                     await c.execute("UPDATE school_outbox SET sent=1 WHERE id=?", (row["id"],))
+            async with school_event.transaction() as c:
+                async with c.execute(
+                    "SELECT DISTINCT season,uid FROM school_prizes "
+                    "WHERE kind='gift' AND done=0 AND attempts<3 LIMIT 10"
+                ) as cur:
+                    gift_owners = await cur.fetchall()
+            for owner in gift_owners:
+                await deliver_school_gifts(bot, owner["season"], owner["uid"])
         except Exception:
             logger.exception("School event notification failed")
         await asyncio.sleep(5)
+
+
+async def bonus_notification_worker(bot: Bot) -> None:
+    while True:
+        try:
+            async with aiosqlite.connect(db.path) as conn:
+                conn.row_factory = aiosqlite.Row
+                async with conn.execute(
+                    "SELECT d.broadcast_id,d.user_id,b.amount,d.attempts "
+                    "FROM bonus_deliveries d JOIN bonus_broadcasts b ON b.id=d.broadcast_id "
+                    "WHERE d.status=0 ORDER BY d.broadcast_id,d.user_id LIMIT 20"
+                ) as cur:
+                    rows = await cur.fetchall()
+            for row in rows:
+                try:
+                    await bot.send_message(
+                        row["user_id"],
+                        f"🎁 Администратор раздал всем игрокам {row['amount']:,} DC!\n"
+                        "🪙 Монеты уже зачислены на твой баланс.".replace(",", " "),
+                    )
+                    status, error = 1, None
+                except Exception as exc:
+                    status = 2 if row["attempts"] >= 2 else 0
+                    error = str(exc)[:300]
+                async with aiosqlite.connect(db.path) as conn:
+                    await conn.execute(
+                        "UPDATE bonus_deliveries SET status=?,attempts=attempts+1,error=? "
+                        "WHERE broadcast_id=? AND user_id=? AND status=0",
+                        (status, error, row["broadcast_id"], row["user_id"]),
+                    )
+                    await conn.commit()
+                await asyncio.sleep(0.05)
+        except Exception:
+            logger.exception("Bonus notification worker failed")
+        await asyncio.sleep(2)
 
 
 async def school_game(user, token, bet, won):
@@ -1576,7 +1785,7 @@ PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
-    "roulette", "dice", "mines", "duel", "exchange", "admin",
+    "roulette", "dice", "mines", "duel", "exchange", "admin", "broadcast",
 }
 
 RUSSIAN_COMMANDS = {
@@ -1589,6 +1798,7 @@ RUSSIAN_COMMANDS = {
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
     "удалитьзаявку": "deletepending",
     "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
+    "раздать": "broadcast",
 }
 
 def parse_plain_command(text: str | None):
@@ -1690,6 +1900,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     if await db.is_banned(message.from_user.id):
         await message.answer(BAN_MESSAGE)
         return
+    await db.register_bot_user(message.from_user.id, display_name(message.from_user))
     if not await is_channel_subscriber(bot, message.from_user.id):
         await send_subscription_prompt(message)
         return
@@ -1703,6 +1914,7 @@ async def check_subscription(callback: CallbackQuery, bot: Bot) -> None:
     if not await is_channel_subscriber(bot, callback.from_user.id):
         await callback.answer("❌ Подписка пока не найдена.", show_alert=True)
         return
+    await db.register_bot_user(callback.from_user.id, display_name(callback.from_user))
     await callback.message.edit_text(
         "👋 Добро пожаловать!\n\nВыберите действие:",
         reply_markup=start_keyboard(callback.from_user.id == ADMIN_ID),
@@ -2318,6 +2530,30 @@ async def cmd_premiumrefund(message: Message, bot: Bot) -> None:
     except Exception as e:
         logger.warning("Could not notify Premium refund recipient: %s", e)
 
+
+@router.message(Command("broadcast"), F.chat.type == "private")
+async def cmd_broadcast(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: раздать СУММА\nПример: раздать 10000")
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        await message.answer("❌ Сумма должна быть целым числом.")
+        return
+    if amount <= 0 or amount > 1_000_000_000:
+        await message.answer("❌ Сумма должна быть от 1 до 1 000 000 000 DC.")
+        return
+    broadcast_id, recipients = await db.create_bonus_broadcast(amount)
+    await message.answer(
+        f"✅ Раздача #{broadcast_id} создана.\n"
+        f"🪙 По {amount:,} DC начислено: {recipients} игрокам.\n"
+        "📨 Уведомления отправляются автоматически.".replace(",", " ")
+    )
+
 # =========================
 # ADMIN PANEL
 # =========================
@@ -2862,6 +3098,7 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
         "createcasepromo КОД КЕЙС КЛЮЧИ ЛИМИТ\n"
         "promos / pending / premiumorders\n"
         "say ТЕКСТ — сообщение в основную группу\n"
+        "раздать СУММА — начислить DC всем пользователям бота\n"
         "popolnit — пополнить баланс звёзд бота",
         reply_markup=admin_back_keyboard(),
     )
@@ -4188,7 +4425,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "addcoins", "removecoins", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
-    "promo", "cases", "slots", "roulette", "dice", "mines", "admin",
+    "promo", "cases", "slots", "roulette", "dice", "mines", "admin", "broadcast",
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop", "bonus", "duel"}
 BOT_ARGUMENT_COMMANDS = {
@@ -4215,6 +4452,7 @@ PLAIN_COMMAND_HANDLERS = {
     "bonus": cmd_bonus, "cases": cmd_cases, "slots": cmd_slots,
     "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines,
     "duel": cmd_duel, "exchange": cmd_exchange, "admin": cmd_admin,
+    "broadcast": cmd_broadcast,
 }
 
 @router.message(is_plain_command)
@@ -4364,6 +4602,7 @@ async def main() -> None:
     asyncio.create_task(casino_timeout_checker(bot))
     asyncio.create_task(duel_timeout_checker(bot))
     asyncio.create_task(school_notifications(bot))
+    asyncio.create_task(bonus_notification_worker(bot))
     logger.info("Бот запущен")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
