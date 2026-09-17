@@ -33,6 +33,8 @@ MAIN_CHAT_ID = int(os.getenv("MAIN_CHAT_ID", "0"))
 LOG_CHAT_ID  = int(os.getenv("LOG_CHAT_ID", "0"))
 GAME_LOG_CHAT_ID = int(os.getenv("GAME_LOG_CHAT_ID", "0"))
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "0"))
+# Можно задать вручную; если не задано, бот сам найдёт привязанный чат канала.
+CHANNEL_CHAT_ID = int(os.getenv("CHANNEL_CHAT_ID", "0") or 0)
 # Обязательная подписка перед открытием меню бота.
 REQUIRED_CHANNEL = "@d_coins_channel"
 REQUIRED_CHANNEL_URL = "https://t.me/d_coins_channel"
@@ -561,8 +563,9 @@ class Database:
         username = username.lower().lstrip("@")
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
-                "SELECT user_id, user_name FROM user_stats WHERE username=? AND chat_id=? LIMIT 1",
-                (username, MAIN_CHAT_ID)
+                "SELECT user_id, user_name FROM user_stats WHERE username=? "
+                "ORDER BY (chat_id=?) DESC LIMIT 1",
+                (username, MAIN_CHAT_ID),
             ) as cur:
                 return await cur.fetchone()
 
@@ -1227,6 +1230,21 @@ PATH_REWARDS = {
     49: [("coins", 7000)], 50: [("gift", 25), ("excellent", 1)],
 }
 
+SCHOOL_BOSSES = {
+    1: {
+        "name": "📚 Архимед Знаний",
+        "max_hp": 5_000_000,
+        "last_hit": 50_000,
+        "top_text": "🥇 NFT · 🥈 Premium · 🥉 подарок 100⭐",
+    },
+    2: {
+        "name": "🌑 Магистр Забвений",
+        "max_hp": 50_000_000,
+        "last_hit": 250_000,
+        "top_text": "🥇 NFT · 🥈 NFT · 🥉 NFT",
+    },
+}
+
 
 class SchoolEvent:
     """All progression, claims, boss damage and refunds use SQLite transactions."""
@@ -1253,7 +1271,7 @@ class SchoolEvent:
     async def init(self):
         async with self.transaction() as c:
             for sql in (
-                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER)",
+                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER, boss_stage INTEGER DEFAULT 1)",
                 "CREATE TABLE IF NOT EXISTS school_players (season INTEGER, uid INTEGER, name TEXT, knowledge INTEGER DEFAULT 0, damage INTEGER DEFAULT 0, reached REAL DEFAULT 0, last_message REAL DEFAULT 0, PRIMARY KEY(season,uid))",
                 "CREATE TABLE IF NOT EXISTS school_quests (season INTEGER, uid INTEGER, day TEXT, quest TEXT, progress INTEGER DEFAULT 0, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day,quest))",
                 "CREATE TABLE IF NOT EXISTS school_days (season INTEGER, uid INTEGER, day TEXT, streak INTEGER, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day))",
@@ -1267,6 +1285,29 @@ class SchoolEvent:
                 prize_columns = {row[1] for row in await cur.fetchall()}
             if "attempts" not in prize_columns:
                 await c.execute("ALTER TABLE school_prizes ADD COLUMN attempts INTEGER DEFAULT 0")
+            async with c.execute("PRAGMA table_info(school_seasons)") as cur:
+                season_columns = {row[1] for row in await cur.fetchall()}
+            if "boss_stage" not in season_columns:
+                await c.execute("ALTER TABLE school_seasons ADD COLUMN boss_stage INTEGER DEFAULT 1")
+
+            # Если Архимеда победили до установки этого обновления, второй босс
+            # появляется при первом запуске новой версии. Знания и путь сохраняются,
+            # а рейтинг урона начинается заново.
+            async with c.execute(
+                "SELECT id FROM school_seasons WHERE boss_stage=1 AND hp<=0 AND killed IS NOT NULL "
+                "AND stopped=0 AND ends>?",
+                (time.time(),),
+            ) as cur:
+                defeated_legacy_seasons = [row[0] for row in await cur.fetchall()]
+            for season_id in defeated_legacy_seasons:
+                await c.execute(
+                    "UPDATE school_seasons SET boss_stage=2,hp=?,max_hp=?,killed=NULL WHERE id=?",
+                    (SCHOOL_BOSSES[2]["max_hp"], SCHOOL_BOSSES[2]["max_hp"], season_id),
+                )
+                await c.execute(
+                    "UPDATE school_players SET damage=0,reached=0 WHERE season=?",
+                    (season_id,),
+                )
 
     async def current(self, c, now=None, active=True):
         row = await self.one(c, "SELECT * FROM school_seasons ORDER BY id DESC LIMIT 1")
@@ -1279,7 +1320,10 @@ class SchoolEvent:
             if await self.current(c):
                 return False
             now = time.time()
-            await c.execute("INSERT INTO school_seasons(started,ends,hp,max_hp) VALUES (?,?,5000000,5000000)", (now, now + 20 * 86400))
+            await c.execute(
+                "INSERT INTO school_seasons(started,ends,hp,max_hp,boss_stage) VALUES (?,?,?,?,1)",
+                (now, now + 20 * 86400, SCHOOL_BOSSES[1]["max_hp"], SCHOOL_BOSSES[1]["max_hp"]),
+            )
             return True
 
     async def stop(self, season):
@@ -1352,21 +1396,53 @@ class SchoolEvent:
                 if refund:
                     await self.coins(c, uid, refund)
                 if damage == season["hp"]:
+                    stage = int(season["boss_stage"] or 1)
+                    boss = SCHOOL_BOSSES.get(stage, SCHOOL_BOSSES[2])
                     await c.execute("UPDATE school_seasons SET killed=? WHERE id=?", (now, sid))
                     async with c.execute("SELECT * FROM school_players WHERE season=? AND damage>0 ORDER BY damage DESC,reached,uid", (sid,)) as cur:
                         players = await cur.fetchall()
-                    for p in players:
-                        rewards = []
-                        if p["damage"] >= 10000:
-                            rewards.append(("coins", 10000))
-                        if p["damage"] >= 100000:
-                            rewards.append(("excellent", 1))
-                        await self.reward(c, sid, p["uid"], "Победа над боссом", rewards)
-                    await self.reward(c, sid, uid, "Последний удар", [("coins", 50000)])
-                    for place, p in enumerate(players[:3], 1):
-                        await self.reward(c, sid, p["uid"], f"Топ-{place} по урону", [[("nft", 1)], [("premium", 1)], [("gift", 100)]][place - 1])
                     top = "\n".join(f"{i}. {p['name']} — {p['damage']:,}" for i, p in enumerate(players[:3], 1))
-                    await c.execute("INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)", (sid, "boss", f"🏆 Архимед Знаний побеждён!\n\n{top}\n\nПоследний удар: {name}.\nDC и ключи начислены. NFT, Premium и подарок топ-3 выдаст администратор. Призовой путь продолжается!"))
+                    if stage == 1:
+                        for p in players:
+                            rewards = []
+                            if p["damage"] >= 10000:
+                                rewards.append(("coins", 10000))
+                            if p["damage"] >= 100000:
+                                rewards.append(("excellent", 1))
+                            await self.reward(c, sid, p["uid"], "Архимед: победа над боссом", rewards)
+                        await self.reward(c, sid, uid, "Архимед: последний удар", [("coins", boss["last_hit"])])
+                        stage_one_prizes = [[("nft", 1)], [("premium", 1)], [("gift", 100)]]
+                        for place, p in enumerate(players[:3], 1):
+                            await self.reward(c, sid, p["uid"], f"Архимед: топ-{place} по урону", stage_one_prizes[place - 1])
+                        await c.execute(
+                            "INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)",
+                            (
+                                sid,
+                                "boss:1",
+                                f"🏆 Архимед Знаний побеждён!\n\n{top}\n\n"
+                                f"Последний удар: {name} — {boss['last_hit']:,} DC.\n"
+                                "Рейтинг урона обнулён. Появился новый босс — 🌑 Магистр Забвений с 50 000 000 HP!",
+                            ),
+                        )
+                        await c.execute(
+                            "UPDATE school_seasons SET boss_stage=2,hp=?,max_hp=?,killed=NULL WHERE id=?",
+                            (SCHOOL_BOSSES[2]["max_hp"], SCHOOL_BOSSES[2]["max_hp"], sid),
+                        )
+                        await c.execute("UPDATE school_players SET damage=0,reached=0 WHERE season=?", (sid,))
+                    else:
+                        await self.reward(c, sid, uid, "Магистр Забвений: последний удар", [("coins", boss["last_hit"])])
+                        for place, p in enumerate(players[:3], 1):
+                            await self.reward(c, sid, p["uid"], f"Магистр Забвений: топ-{place} по урону", [("nft", 1)])
+                        await c.execute(
+                            "INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)",
+                            (
+                                sid,
+                                "boss:2",
+                                f"🏆 Магистр Забвений побеждён!\n\n{top}\n\n"
+                                f"Последний удар: {name} — {boss['last_hit']:,} DC.\n"
+                                "Все игроки из топ-3 получают NFT. Рейтинг зафиксирован!",
+                            ),
+                        )
             return damage, refund
 
     async def claim(self, sid, uid, name, category, value):
@@ -1541,20 +1617,25 @@ async def event_page(uid, name, page):
             buttons.append([InlineKeyboardButton(text=str(i * 10 + 1) + "–" + str(i * 10 + 10), callback_data=f"school:path:{i}") for i in range(5)])
             text = "\n".join(lines) + footer
         else:
+            stage = int(season["boss_stage"] or 1)
+            boss = SCHOOL_BOSSES.get(stage, SCHOOL_BOSSES[2])
             async with c.execute("SELECT * FROM school_players WHERE season=? AND damage>0 ORDER BY damage DESC,reached,uid", (sid,)) as cur:
                 ranked = await cur.fetchall()
             rank = next((str(i) for i, r in enumerate(ranked, 1) if r["uid"] == uid), "—")
             if page == "top":
-                text = "🏆 Топ по урону Архимеду\n\n" + ("\n".join(f"{i}. {r['name']} — {r['damage']:,}" for i, r in enumerate(ranked[:10], 1)) or "Урона пока нет.")
-                text += f"\n\nТвоё место: {rank}\n🥇 NFT · 🥈 Premium · 🥉 подарок 100⭐" + footer
+                text = f"🏆 Топ по урону · {boss['name']}\n\n" + ("\n".join(f"{i}. {r['name']} — {r['damage']:,}" for i, r in enumerate(ranked[:10], 1)) or "Урона пока нет.")
+                text += f"\n\nТвоё место: {rank}\n{boss['top_text']}" + footer
                 buttons.append([InlineKeyboardButton(text="🔄 Обновить топ", callback_data="school:top")])
             else:
                 hours = max(0, int((season["ends"] - now) / 3600))
-                text = f"📚 Архимед Знаний\n❤️ {season['hp']:,} / {season['max_hp']:,} HP\n⚔️ Твой урон: {p['damage'] if p else 0:,}\n🏆 Твоё место: {rank}\n⏳ Осталось: {hours // 24} д. {hours % 24} ч."
+                text = f"{boss['name']}\n❤️ {season['hp']:,} / {season['max_hp']:,} HP\n⚔️ Твой урон: {p['damage'] if p else 0:,}\n🏆 Твоё место: {rank}\n⏳ Осталось: {hours // 24} д. {hours % 24} ч."
                 text += "\n\nПроигранные ставки наносят урон. Дуэли не учитываются. Очки знаний идут только в призовой путь."
-                text += "\nЗа победу: от 10 000 урона — 10 000 DC; от 100 000 — также ключ Отличника. Последний удар: 50 000 DC."
+                if stage == 1:
+                    text += "\nЗа победу: от 10 000 урона — 10 000 DC; от 100 000 — также ключ Отличника. Последний удар: 50 000 DC. После победы появится Магистр Забвений."
+                else:
+                    text += "\nТоп-1, топ-2 и топ-3 получают NFT. Последний удар: 250 000 DC."
                 if season["hp"] == 0:
-                    text += "\n\n🏆 Босс побеждён! Рейтинг зафиксирован."
+                    text += "\n\n🏆 Магистр Забвений побеждён! Рейтинг зафиксирован."
                 text += footer
                 buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="school:boss")])
     buttons.extend(event_navigation())
@@ -1947,7 +2028,7 @@ async def send_help(message: Message) -> None:
         "• кубик 3 50\n"
         "• мины 2500\n"
         "В минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n"
-        "⚔️ Дуэли — только в основном чате\n"
+        "⚔️ Дуэли — в основном чате и привязанном чате канала\n"
         "• дуэль 1000 — создать вызов на 1 000 DC\n"
         "• дуэль 1000 @username — вызвать конкретного игрока\n"
         "Также можно ответить «дуэль 1000» на сообщение соперника.\n"
@@ -4219,6 +4300,27 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
 # GROUP — DUELS
 # =========================
 
+def is_duel_chat(chat) -> bool:
+    return chat.type in {"group", "supergroup"} and chat.id in {MAIN_CHAT_ID, CHANNEL_CHAT_ID}
+
+
+async def resolve_channel_chat(bot: Bot) -> int:
+    """Определяет привязанный чат обязательного канала, если ID не задан вручную."""
+    global CHANNEL_CHAT_ID
+    if CHANNEL_CHAT_ID:
+        logger.info("Чат канала для дуэлей: %s", CHANNEL_CHAT_ID)
+        return CHANNEL_CHAT_ID
+    try:
+        channel = await bot.get_chat(REQUIRED_CHANNEL)
+        CHANNEL_CHAT_ID = int(getattr(channel, "linked_chat_id", 0) or 0)
+        if CHANNEL_CHAT_ID:
+            logger.info("Автоматически найден чат канала для дуэлей: %s", CHANNEL_CHAT_ID)
+        else:
+            logger.warning("У канала %s не найден привязанный чат", REQUIRED_CHANNEL)
+    except Exception as error:
+        logger.warning("Не удалось определить привязанный чат канала: %s", error)
+    return CHANNEL_CHAT_ID
+
 def duel_keyboard(duel_id: str, bet: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -4232,12 +4334,14 @@ def duel_keyboard(duel_id: str, bet: int) -> InlineKeyboardMarkup:
 @router.message(Command("duel"))
 @serialized_game
 async def cmd_duel(message: Message) -> None:
-    if message.chat.id != MAIN_CHAT_ID or message.chat.type not in {"group", "supergroup"}:
+    if not is_duel_chat(message.chat):
         return
     if not message.from_user or message.from_user.is_bot or message.sender_chat:
         await message.reply("❌ Дуэль нельзя создать от имени канала.")
         return
     user_id = message.from_user.id
+    if message.from_user.username:
+        await db.set_username(user_id, message.from_user.username, message.chat.id, display_name(message.from_user))
     if await db.is_banned(user_id):
         await message.reply(BAN_MESSAGE)
         return
@@ -4461,7 +4565,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "promo", "cases", "slots", "roulette", "dice", "mines", "admin", "broadcast",
 }
-GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop", "duel"}
+GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "say", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
@@ -4499,6 +4603,8 @@ async def plain_command_handler(message: Message, bot: Bot) -> None:
         return
     if command in GROUP_PLAIN_COMMANDS and message.chat.id != MAIN_CHAT_ID:
         return
+    if command == "duel" and not is_duel_chat(message.chat):
+        return
     if command == "bonus" and message.chat.type != "private" and message.chat.id != MAIN_CHAT_ID:
         return
 
@@ -4516,6 +4622,26 @@ async def plain_command_handler(message: Message, bot: Bot) -> None:
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def group_handler(message: Message, bot: Bot) -> None:
     if message.chat.id != MAIN_CHAT_ID:
+        if message.chat.id == CHANNEL_CHAT_ID:
+            # В чате канала разрешены дуэли, но обычные сообщения не участвуют
+            # в розыгрыше основной группы. Username сохраняем для адресных вызовов.
+            if (
+                message.from_user
+                and not message.from_user.is_bot
+                and not message.sender_chat
+                and message.from_user.username
+            ):
+                await db.set_username(
+                    message.from_user.id,
+                    message.from_user.username,
+                    message.chat.id,
+                    display_name(message.from_user),
+                )
+            return
+        if not CHANNEL_CHAT_ID:
+            # Не выходим из неизвестных групп, пока связанный чат канала не
+            # удалось определить: это защищает от выхода при временной ошибке API.
+            return
         if message.chat.id not in {LOG_CHAT_ID, GAME_LOG_CHAT_ID}:
             try:
                 await bot.leave_chat(message.chat.id)
@@ -4619,6 +4745,7 @@ async def main() -> None:
     await school_event.init()
     await load_runtime_settings()
     bot = Bot(token=TOKEN)
+    await resolve_channel_chat(bot)
     dp  = Dispatcher()
     dp.include_router(router)
     asyncio.create_task(daily_reset_task(bot))
