@@ -1245,6 +1245,15 @@ SCHOOL_BOSSES = {
     },
 }
 
+LOSS_SHARE_MIN_AMOUNT = 10_000
+
+
+def loss_share_chance(lost_amount: int) -> float:
+    """10k → 10%, 25k → 4%, 50k → 2%, 100k → 1%."""
+    if lost_amount < LOSS_SHARE_MIN_AMOUNT:
+        return 0.0
+    return min(0.10, 1_000 / lost_amount)
+
 
 class SchoolEvent:
     """All progression, claims, boss damage and refunds use SQLite transactions."""
@@ -1395,6 +1404,33 @@ class SchoolEvent:
                 await c.execute("UPDATE school_seasons SET hp=hp-? WHERE id=?", (damage, sid))
                 if refund:
                     await self.coins(c, uid, refund)
+
+                # Редкое перераспределение проигрыша: полный урон остаётся боссу,
+                # а половина реально потерянной суммы начисляется случайному
+                # участнику текущего топ-10 (кроме самого проигравшего).
+                share_chance = loss_share_chance(damage)
+                if share_chance and random.random() < share_chance:
+                    async with c.execute(
+                        "SELECT uid,name FROM school_players WHERE season=? AND damage>0 "
+                        "ORDER BY damage DESC,reached,uid LIMIT 10",
+                        (sid,),
+                    ) as cur:
+                        top_ten = await cur.fetchall()
+                    candidates = [player for player in top_ten if player["uid"] != uid]
+                    if candidates:
+                        recipient = random.choice(candidates)
+                        share_amount = damage // 2
+                        await self.coins(c, recipient["uid"], share_amount)
+                        await c.execute(
+                            "INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)",
+                            (
+                                sid,
+                                f"loss-share:{uid}:{token}",
+                                "🎁 Босс перераспределил потерянные знания!\n\n"
+                                f"{recipient['name']} получает {share_amount:,} DC из проигранной ставки "
+                                f"игрока {name}.".replace(",", " "),
+                            ),
+                        )
                 if damage == season["hp"]:
                     stage = int(season["boss_stage"] or 1)
                     boss = SCHOOL_BOSSES.get(stage, SCHOOL_BOSSES[2])
