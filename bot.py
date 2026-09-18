@@ -287,9 +287,14 @@ class Database:
                 CREATE TABLE IF NOT EXISTS coins (
                     user_id         INTEGER PRIMARY KEY,
                     balance         INTEGER DEFAULT 10,
+                    visual_balance  INTEGER DEFAULT 0,
                     last_coin_bonus REAL    DEFAULT 0
                 )
             """)
+            async with db.execute("PRAGMA table_info(coins)") as cur:
+                coin_columns = [row[1] for row in await cur.fetchall()]
+            if "visual_balance" not in coin_columns:
+                await db.execute("ALTER TABLE coins ADD COLUMN visual_balance INTEGER DEFAULT 0")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS promo_codes (
                     code       TEXT PRIMARY KEY COLLATE NOCASE,
@@ -728,6 +733,54 @@ class Database:
                 row = await cur.fetchone()
         return row if row else (COINS_START, 0.0)
 
+    async def get_balance_details(self, user_id: int) -> tuple[int, int, int]:
+        """Возвращает отображаемый, реальный и визуальный баланс."""
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT balance,COALESCE(visual_balance,0) FROM coins WHERE user_id=?",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        real, visual = (int(row[0]), int(row[1])) if row else (COINS_START, 0)
+        return real + visual, real, visual
+
+    async def get_display_balance(self, user_id: int) -> int:
+        displayed, _, _ = await self.get_balance_details(user_id)
+        return displayed
+
+    async def change_visual_balance(self, user_id: int, amount: int) -> tuple[bool, int, int, int]:
+        """Меняет только визуальные DC; они никогда не участвуют в списаниях."""
+        if amount == 0:
+            displayed, real, visual = await self.get_balance_details(user_id)
+            return False, displayed, real, visual
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute(
+                    "INSERT OR IGNORE INTO coins(user_id,balance,visual_balance) VALUES (?,?,0)",
+                    (user_id, COINS_START),
+                )
+                cursor = await db.execute(
+                    "UPDATE coins SET visual_balance=visual_balance+? "
+                    "WHERE user_id=? AND visual_balance+?>=0",
+                    (amount, user_id, amount),
+                )
+                if cursor.rowcount != 1:
+                    await db.rollback()
+                    displayed, real, visual = await self.get_balance_details(user_id)
+                    return False, displayed, real, visual
+                async with db.execute(
+                    "SELECT balance,visual_balance FROM coins WHERE user_id=?",
+                    (user_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                await db.commit()
+                real, visual = int(row[0]), int(row[1])
+                return True, real + visual, real, visual
+            except Exception:
+                await db.rollback()
+                raise
+
     async def add_coins(self, user_id: int, amount: int) -> int:
         async with aiosqlite.connect(self.path) as db:
             await db.execute("""
@@ -816,10 +869,11 @@ class Database:
     async def get_coins_top(self, limit: int = 10) -> list:
         async with aiosqlite.connect(self.path) as db:
             async with db.execute("""
-                SELECT c.user_id, COALESCE(u.user_name, CAST(c.user_id AS TEXT)), c.balance
+                SELECT c.user_id, COALESCE(u.user_name, CAST(c.user_id AS TEXT)),
+                       c.balance + COALESCE(c.visual_balance,0) AS shown_balance
                 FROM coins c
                 LEFT JOIN user_stats u ON u.user_id = c.user_id AND u.chat_id = ?
-                ORDER BY c.balance DESC LIMIT ?
+                ORDER BY shown_balance DESC LIMIT ?
             """, (MAIN_CHAT_ID, limit)) as cur:
                 return await cur.fetchall()
 
@@ -1904,7 +1958,7 @@ async def school_game(user, token, bet, won):
 PLAIN_COMMANDS = {
     "start", "help", "say", "vip", "unvip", "viplist",
     "ban", "unban", "banlist", "addmsgs", "removemsgs", "addday", "removeday",
-    "addcoins", "removecoins", "createpromo", "deletepromo", "createcasepromo",
+    "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "cointop",
@@ -1921,6 +1975,7 @@ RUSSIAN_COMMANDS = {
     "промо": "promo", "перевод": "transfer", "слоты": "slots",
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
     "удалитьзаявку": "deletepending",
+    "добавитьвизуал": "addvisual", "убратьвизуал": "removevisual",
     "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
     "раздать": "broadcast",
 }
@@ -2315,8 +2370,9 @@ async def cmd_addcoins(message: Message) -> None:
         await message.answer("❌ Количество должно быть положительным.")
         return
     new_balance = await db.add_coins(user_id, amount)
+    shown_balance = await db.get_display_balance(user_id)
     name = await db.get_user_name(user_id)
-    await message.answer(f"✅ Добавлено {amount} DC\n👤 {name} ({user_id})\n🪙 Баланс: {new_balance} D-COINS")
+    await message.answer(f"✅ Добавлено {amount} DC\n👤 {name} ({user_id})\n🪙 Баланс: {shown_balance} D-COINS")
 
 @router.message(Command("removecoins"), F.chat.type == "private")
 async def cmd_removecoins(message: Message) -> None:
@@ -2339,9 +2395,56 @@ async def cmd_removecoins(message: Message) -> None:
     name = await db.get_user_name(user_id)
     balance, _ = await db.get_coins(user_id)
     if ok:
-        await message.answer(f"✅ Убрано {amount} DC\n👤 {name} ({user_id})\n🪙 Баланс: {balance} D-COINS")
+        shown_balance = await db.get_display_balance(user_id)
+        await message.answer(f"✅ Убрано {amount} DC\n👤 {name} ({user_id})\n🪙 Баланс: {shown_balance} D-COINS")
     else:
         await message.answer(f"❌ Недостаточно монет\n👤 {name} ({user_id})\n🪙 Баланс: {balance} D-COINS")
+
+
+async def change_visual_command(message: Message, remove: bool = False) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split()
+    command_name = "removevisual" if remove else "addvisual"
+    if len(args) != 3:
+        await message.answer(f"Использование: {command_name} user_id количество")
+        return
+    try:
+        user_id = int(args[1])
+        amount = int(args[2])
+    except ValueError:
+        await message.answer("❌ ID и количество должны быть целыми числами.")
+        return
+    if amount <= 0:
+        await message.answer("❌ Количество должно быть положительным.")
+        return
+    ok, displayed, real, visual = await db.change_visual_balance(
+        user_id,
+        -amount if remove else amount,
+    )
+    name = await db.get_user_name(user_id)
+    if not ok:
+        await message.answer(
+            f"❌ Недостаточно визуальных DC.\n👤 {name} ({user_id})\n"
+            f"👁 Визуальных: {visual:,} DC".replace(",", " ")
+        )
+        return
+    action = "Убрано" if remove else "Добавлено"
+    await message.answer(
+        f"✅ {action} {amount:,} визуальных DC\n👤 {name} ({user_id})\n"
+        f"🪙 Отображается: {displayed:,} DC\n"
+        f"💰 Реальных: {real:,} DC\n👁 Визуальных: {visual:,} DC".replace(",", " ")
+    )
+
+
+@router.message(Command("addvisual"), F.chat.type == "private")
+async def cmd_addvisual(message: Message) -> None:
+    await change_visual_command(message)
+
+
+@router.message(Command("removevisual"), F.chat.type == "private")
+async def cmd_removevisual(message: Message) -> None:
+    await change_visual_command(message, remove=True)
 
 @router.message(Command("createpromo"), F.chat.type == "private")
 async def cmd_createpromo(message: Message, bot: Bot) -> None:
@@ -2511,11 +2614,12 @@ async def successful_payment_handler(message: Message, bot: Bot) -> None:
     if not credited:
         await message.answer("ℹ️ Эта оплата уже была зачислена ранее.")
         return
+    shown_balance = await db.get_display_balance(message.from_user.id)
     await message.answer(
         f"✅ Оплата прошла!\n"
         f"🪙 Зачислено: {dc_amount:,} DC\n"
         f"⭐ Оплачено: {star_amount}⭐\n"
-        f"🪙 Баланс: {new_balance:,} DC".replace(",", " ")
+        f"🪙 Баланс: {shown_balance:,} DC".replace(",", " ")
     )
     await send_log(
         bot,
@@ -2665,12 +2769,13 @@ async def cmd_premiumrefund(message: Message, bot: Bot) -> None:
         return
     _, user_id, user_name, cost, _ = order
     new_balance = await db.add_coins(user_id, cost)
+    shown_balance = await db.get_display_balance(user_id)
     await db.remove_premium_order(order_id)
     await message.answer(f"↩️ Возвращено {cost:,} DC игроку {user_name} ({user_id}).".replace(",", " "))
     try:
         await bot.send_message(
             user_id,
-            f"↩️ Premium пока недоступен — тебе вернули {cost:,} DC.\n🪙 Баланс: {new_balance:,} DC".replace(",", " "),
+            f"↩️ Premium пока недоступен — тебе вернули {cost:,} DC.\n🪙 Баланс: {shown_balance:,} DC".replace(",", " "),
         )
     except Exception as e:
         logger.warning("Could not notify Premium refund recipient: %s", e)
@@ -2886,9 +2991,10 @@ async def admin_premiumrefund_callback(callback: CallbackQuery, bot: Bot) -> Non
         return
     _, user_id, user_name, cost, _ = order
     new_balance = await db.add_coins(user_id, cost)
+    shown_balance = await db.get_display_balance(user_id)
     await db.remove_premium_order(order_id)
     try:
-        await bot.send_message(user_id, f"↩️ Тебе вернули {cost:,} DC. Баланс: {new_balance:,} DC".replace(",", " "))
+        await bot.send_message(user_id, f"↩️ Тебе вернули {cost:,} DC. Баланс: {shown_balance:,} DC".replace(",", " "))
     except Exception as e:
         logger.warning("Could not notify Premium refund recipient: %s", e)
     await render_admin_premium(callback, f"↩️ {cost:,} DC возвращено игроку {user_name}.".replace(",", " "))
@@ -3240,6 +3346,7 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         "🛠 Основные админ-команды\n\n"
         "addcoins ID СУММА / removecoins ID СУММА\n"
+        "addvisual ID СУММА / removevisual ID СУММА\n"
         "addmsgs ID КОЛ-ВО / removemsgs ID КОЛ-ВО\n"
         "vip ID / unvip ID / ban ID ПРИЧИНА / unban ID\n"
         "createpromo КОД DC [ЛИМИТ] [скрытый]\n"
@@ -3266,7 +3373,7 @@ async def cmd_stats(message: Message) -> None:
     user_id = message.from_user.id
     chance, msg_count, _ = await db.get_user(user_id, message.chat.id)
     wins = await db.get_wins_count(user_id, message.chat.id)
-    balance, _ = await db.get_coins(user_id)
+    balance = await db.get_display_balance(user_id)
     await message.reply(
         f"📊 Статистика:\n\n"
         f"📈 Шанс: {chance:.3f}%\n"
@@ -3327,7 +3434,7 @@ async def cmd_coins(message: Message) -> None:
     if await db.is_banned(message.from_user.id):
         await message.reply(BAN_MESSAGE)
         return
-    balance, _ = await db.get_coins(message.from_user.id)
+    balance = await db.get_display_balance(message.from_user.id)
     await message.reply(f"🪙 Твой баланс: {balance} D-COINS")
 
 @router.message(Command("promo"), F.chat.type == "private")
@@ -3350,7 +3457,7 @@ async def cmd_promo(message: Message) -> None:
                 f"🔑 Ключей: {keys}\n👥 Активаций: {limit_text}"
             )
         else:
-            balance, _ = await db.get_coins(message.from_user.id)
+            balance = await db.get_display_balance(message.from_user.id)
             await message.answer(f"✅ Промокод активирован!\n🎁 Получено: {reward} DC\n🪙 Баланс: {balance} DC\n👥 Активаций: {limit_text}")
     elif status == "already_used":
         await message.answer("❌ Ты уже активировал этот промокод.")
@@ -3438,9 +3545,11 @@ async def cmd_transfer(message: Message, bot: Bot) -> None:
     if not ok:
         balance, _ = await db.get_coins(sender_id)
         await message.reply(
-            f"❌ Недостаточно D-COINS.\n🪙 Твой баланс: {balance} DC"
+            f"❌ Недостаточно D-COINS.\n💰 Реальный баланс: {balance} DC"
         )
         return
+    sender_balance = await db.get_display_balance(sender_id)
+    recipient_balance = await db.get_display_balance(target_id)
 
     sender_name = display_name(message.from_user)
     if not target_name:
@@ -3510,7 +3619,8 @@ async def cmd_bonus(message: Message) -> None:
 
     if now - last_coin_bonus >= COINS_BONUS_CD:
         coins_amount = COINS_VIP_BONUS if is_vip else COINS_BONUS
-        new_balance  = await db.add_coins(user_id, coins_amount)
+        await db.add_coins(user_id, coins_amount)
+        new_balance = await db.get_display_balance(user_id)
         await db.set_coin_bonus_time(user_id)
         await school_event.record(user_id, name, f"bonus:{message.chat.id}:{message.message_id}", {"bonus": 1})
         coin_text = f"🪙 D-COINS: +{coins_amount} → {new_balance} DC"
@@ -3595,7 +3705,7 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
     if payment == "insufficient":
         case_open_cooldowns.pop(user_id, None)
         balance, _ = await db.get_coins(user_id)
-        await callback.answer(f"❌ Нужно {case['price']} DC, у тебя {balance}", show_alert=True)
+        await callback.answer(f"❌ Нужно {case['price']} DC, реальный баланс: {balance}", show_alert=True)
         return
 
     if isinstance(case["rewards"][0][0], str):
@@ -3606,7 +3716,7 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
         reward, _ = random.choices(case["rewards"], weights=[item[1] for item in case["rewards"]], k=1)[0]
         kind = "coins"
     if kind == "coins":
-        new_balance = await db.add_coins(user_id, reward)
+        await db.add_coins(user_id, reward)
         prize_text = f"🎉 Выпало: {reward:,} DC".replace(",", " ")
     else:
         gift_key = {15: 5, 25: 10, 50: 15, 100: 20}[reward]
@@ -3617,7 +3727,7 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
         except Exception as e:
             await db.add_pending_gift(user_id, await db.get_user_name(user_id), gift_id, f"кейс {case['title']}: {e}")
             prize_text = f"🎁 Выпал подарок {reward}⭐\n⏳ Добавлен в очередь выдачи."
-        new_balance, _ = await db.get_coins(user_id)
+    new_balance = await db.get_display_balance(user_id)
     keys = await db.get_case_keys(user_id, case_id)
     payment_text = "🔑 Использован ключ кейса" if payment == "key" else f"💸 Списано: {case['price']:,} DC".replace(",", " ")
     result_text = (
@@ -3696,7 +3806,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
 
     balance, _ = await db.get_coins(user_id)
     if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n🪙 Твой баланс: {balance} DC")
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
     if user_id in casino_bet_cooldowns:
@@ -3705,9 +3815,9 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     casino_bet_cooldowns[user_id] = True
     if not await db.remove_coins(user_id, bet):
         casino_bet_cooldowns.pop(user_id, None)
-        await message.reply("❌ Недостаточно D-COINS!")
+        balance, _ = await db.get_coins(user_id)
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
-    balance_after, _ = await db.get_coins(user_id)
 
     SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎"]
     s1 = random.choice(SYMBOLS)
@@ -3718,7 +3828,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
         win = bet * 2
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
-        new_balance, _ = await db.get_coins(user_id)
+        new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎰 {s1} {s2} {s3}\n\n"
             f"✅ Ты выиграл!\n"
@@ -3729,7 +3839,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
         await send_game_log(bot, f"🎰 Слоты\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC")
     else:
         boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
-        balance_after, _ = await db.get_coins(user_id)
+        balance_after = await db.get_display_balance(user_id)
         await message.reply(
             f"🎰 {s1} {s2} {s3}\n\n"
             f"❌ Не повезло!\n"
@@ -3773,7 +3883,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
 
     balance, _ = await db.get_coins(user_id)
     if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n🪙 Твой баланс: {balance} DC")
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
     if user_id in casino_bet_cooldowns:
@@ -3782,7 +3892,8 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     casino_bet_cooldowns[user_id] = True
     if not await db.remove_coins(user_id, bet):
         casino_bet_cooldowns.pop(user_id, None)
-        await message.reply("❌ Недостаточно D-COINS!")
+        balance, _ = await db.get_coins(user_id)
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
     result_color = random.choice(["red"] * 18 + ["black"] * 18 + ["green"])
@@ -3794,7 +3905,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         win = bet * 2
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
-        new_balance, _ = await db.get_coins(user_id)
+        new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎡 Выпало: {result_emoji}\n\n"
             f"✅ Ты выиграл!\n"
@@ -3805,7 +3916,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         await send_game_log(bot, f"🎡 Рулетка\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {chosen_emoji}\nВыпало: {result_emoji}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC")
     else:
         boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
-        new_balance, _ = await db.get_coins(user_id)
+        new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎡 Выпало: {result_emoji}\n\n"
             f"❌ Не повезло!\n"
@@ -3849,7 +3960,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
 
     balance, _ = await db.get_coins(user_id)
     if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n🪙 Твой баланс: {balance} DC")
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
     if user_id in casino_bet_cooldowns:
@@ -3858,7 +3969,8 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
     casino_bet_cooldowns[user_id] = True
     if not await db.remove_coins(user_id, bet):
         casino_bet_cooldowns.pop(user_id, None)
-        await message.reply("❌ Недостаточно D-COINS!")
+        balance, _ = await db.get_coins(user_id)
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
     rolled = random.randint(1, 6)
@@ -3867,7 +3979,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
         win = bet * 2
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
-        new_balance, _ = await db.get_coins(user_id)
+        new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎲 Выпало: {rolled}\n\n"
             f"✅ Угадал!\n"
@@ -3878,7 +3990,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
         await send_game_log(bot, f"🎲 Кубик\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {number}\nВыпало: {rolled}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC")
     else:
         boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
-        new_balance, _ = await db.get_coins(user_id)
+        new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎲 Выпало: {rolled}\n\n"
             f"❌ Не угадал! (ты выбрал {number})\n"
@@ -3980,7 +4092,7 @@ async def start_mines_game(message: Message) -> None:
         return
     if not await db.remove_coins(user_id, bet):
         balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n🪙 Твой баланс: {balance} DC")
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
     casino_bet_cooldowns[user_id] = True
@@ -4030,7 +4142,7 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
     if cell in game["mines"]:
         active_games.pop(user_id, None)
         boss_note = await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], False)
-        balance, _ = await db.get_coins(user_id)
+        balance = await db.get_display_balance(user_id)
         await callback.message.edit_text(
             "💣 Игра завершена!\n💵 Вы проиграли." + boss_note,
             reply_markup=mines_keyboard(game, reveal=True),
@@ -4048,8 +4160,9 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
     if len(game["opened"]) == MINES_GRID_SIZE - MINES_COUNT:
         prize = mines_prize(game["bet"], len(game["opened"]))
         active_games.pop(user_id, None)
-        balance = await db.add_coins(user_id, prize)
+        await db.add_coins(user_id, prize)
         await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
+        balance = await db.get_display_balance(user_id)
         await callback.message.edit_text(
             f"🏆 Поле очищено!\n💵 Выигрыш: x{mines_multiplier(len(game['opened'])):.2f} | {prize:,} DC\n🪙 Баланс: {balance:,} DC".replace(",", " "),
             reply_markup=mines_keyboard(game, reveal=True),
@@ -4076,8 +4189,9 @@ async def mines_cashout(callback: CallbackQuery, bot: Bot) -> None:
         return
     prize = mines_prize(game["bet"], safe_opened)
     active_games.pop(user_id, None)
-    balance = await db.add_coins(user_id, prize)
+    await db.add_coins(user_id, prize)
     await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
+    balance = await db.get_display_balance(user_id)
     await callback.message.edit_text(
         f"✅ Вы забрали выигрыш!\n💵 Выигрыш: x{mines_multiplier(safe_opened):.2f} | {prize:,} DC\n🪙 Баланс: {balance:,} DC".replace(",", " "),
         reply_markup=mines_keyboard(game, reveal=True),
@@ -4106,7 +4220,7 @@ async def cmd_exchange(message: Message) -> None:
     if await db.is_banned(message.from_user.id):
         await message.reply(BAN_MESSAGE)
         return
-    balance, _ = await db.get_coins(message.from_user.id)
+    balance = await db.get_display_balance(message.from_user.id)
     await message.reply(
         f"💱 Обмен D-COINS\n\n"
         f"🪙 Твой баланс: {balance} DC\n\n"
@@ -4126,7 +4240,7 @@ async def buy_dc_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "buy_dc_back")
 async def buy_dc_back(callback: CallbackQuery) -> None:
-    balance, _ = await db.get_coins(callback.from_user.id)
+    balance = await db.get_display_balance(callback.from_user.id)
     await callback.message.edit_text(
         f"💱 Обмен D-COINS\n\n🪙 Твой баланс: {balance:,} DC\n\nВыбери что хочешь получить:".replace(",", " "),
         reply_markup=exchange_keyboard(balance),
@@ -4168,17 +4282,17 @@ async def exch_chance(callback: CallbackQuery) -> None:
         return
     balance, _ = await db.get_coins(user_id)
     if balance < cost:
-        await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
+        await callback.answer(f"❌ Нужно {cost} DC, реальный баланс: {balance}", show_alert=True)
         return
     if not await db.remove_coins(user_id, cost):
         balance, _ = await db.get_coins(user_id)
-        await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
+        await callback.answer(f"❌ Нужно {cost} DC, реальный баланс: {balance}", show_alert=True)
         return
     chance, msg_count, last_bonus = await db.get_user(user_id, MAIN_CHAT_ID)
     new_chance = min(round(chance + 1.0, 3), MAX_CHANCE)
     name = await db.get_user_name(user_id)
     await db.update_user(user_id, MAIN_CHAT_ID, name, new_chance, msg_count, last_bonus)
-    new_balance, _ = await db.get_coins(user_id)
+    new_balance = await db.get_display_balance(user_id)
     await callback.message.edit_text(
         f"✅ Обменял {cost} DC на +1% шанса\n"
         f"🪙 Баланс: {new_balance} DC\n"
@@ -4194,7 +4308,7 @@ async def process_exchange_gift(callback: CallbackQuery, cost: int, gift_key: in
         return
     balance, _ = await db.get_coins(user_id)
     if balance < cost:
-        await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
+        await callback.answer(f"❌ Нужно {cost} DC, реальный баланс: {balance}", show_alert=True)
         return
     gift_ids = GIFT_IDS.get(gift_key, [])
     gift_id  = random.choice(gift_ids) if gift_ids else None
@@ -4205,11 +4319,11 @@ async def process_exchange_gift(callback: CallbackQuery, cost: int, gift_key: in
 
     if not await db.remove_coins(user_id, cost):
         balance, _ = await db.get_coins(user_id)
-        await callback.answer(f"❌ Нужно {cost} DC, у тебя {balance}", show_alert=True)
+        await callback.answer(f"❌ Нужно {cost} DC, реальный баланс: {balance}", show_alert=True)
         return
 
     name = await db.get_user_name(user_id)
-    new_balance, _ = await db.get_coins(user_id)
+    new_balance = await db.get_display_balance(user_id)
     pending_reason = f"обмен {cost} DC → {reward_label}"
     try:
         star_balance = await bot.get_my_star_balance()
@@ -4296,7 +4410,7 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
     if not await db.remove_coins(user_id, cost):
         balance, _ = await db.get_coins(user_id)
         await callback.answer(
-            f"❌ Нужно {cost:,} DC, у тебя {balance:,}".replace(",", " "),
+            f"❌ Нужно {cost:,} DC, реальный баланс: {balance:,}".replace(",", " "),
             show_alert=True,
         )
         return
@@ -4310,7 +4424,7 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("❌ Не удалось создать заявку. DC возвращены.", show_alert=True)
         return
 
-    new_balance, _ = await db.get_coins(user_id)
+    new_balance = await db.get_display_balance(user_id)
     await callback.message.edit_text(
         f"✅ Заявка #{order_id} на Premium на месяц создана\n"
         f"🪙 Списано: {cost:,} DC\n"
@@ -4408,7 +4522,7 @@ async def cmd_duel(message: Message) -> None:
         return
     balance, _ = await db.get_coins(user_id)
     if balance < bet:
-        await message.reply(f"❌ Для дуэли нужно {bet:,} DC, у тебя {balance:,} DC.".replace(",", " "))
+        await message.reply(f"❌ Для дуэли нужно {bet:,} DC, реальный баланс: {balance:,} DC.".replace(",", " "))
         return
 
     target_id = None
@@ -4567,7 +4681,7 @@ async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
              "gamewin": int(participant == winner_id), "bets": bet})
     winner_name = duel["challenger_name"] if winner_id == challenger_id else opponent_name
     loser_name = opponent_name if winner_id == challenger_id else duel["challenger_name"]
-    winner_balance = challenger_balance if winner_id == challenger_id else opponent_balance
+    winner_balance = await db.get_display_balance(winner_id)
     await callback.message.edit_text(
         (
             "⚔️ Дуэль завершена!\n\n"
@@ -4596,7 +4710,7 @@ async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
 PRIVATE_PLAIN_COMMANDS = {
     "start", "say", "vip", "unvip", "viplist", "ban",
     "unban", "banlist", "addmsgs", "removemsgs", "addday", "removeday",
-    "addcoins", "removecoins", "createpromo", "deletepromo", "createcasepromo",
+    "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "promo", "cases", "slots", "roulette", "dice", "mines", "admin", "broadcast",
@@ -4614,6 +4728,7 @@ PLAIN_COMMAND_HANDLERS = {
     "addmsgs": cmd_addmsgs, "removemsgs": cmd_removemsgs,
     "addday": cmd_addday, "removeday": cmd_removeday,
     "addcoins": cmd_addcoins, "removecoins": cmd_removecoins,
+    "addvisual": cmd_addvisual, "removevisual": cmd_removevisual,
     "createpromo": cmd_createpromo, "deletepromo": cmd_deletepromo,
     "createcasepromo": cmd_createcasepromo, "promos": cmd_promos,
     "balance": cmd_balance, "popolnit": cmd_popolnit, "sendgift": cmd_sendgift,
