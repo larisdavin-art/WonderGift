@@ -348,6 +348,26 @@ class Database:
                 )
             """)
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS support_access (
+                    user_id    INTEGER PRIMARY KEY,
+                    granted_at REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS support_sessions (
+                    user_id    INTEGER PRIMARY KEY,
+                    active     INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS support_links (
+                    admin_message_id INTEGER PRIMARY KEY,
+                    user_id          INTEGER NOT NULL,
+                    created_at       REAL NOT NULL
+                )
+            """)
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key        TEXT PRIMARY KEY,
                     value      REAL NOT NULL,
@@ -940,6 +960,73 @@ class Database:
                 (user_id, user_name, time.time()),
             )
             await db.commit()
+
+    async def grant_support_access(self, user_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO support_access(user_id,granted_at) VALUES (?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET granted_at=excluded.granted_at",
+                (user_id, time.time()),
+            )
+            await db.commit()
+
+    async def revoke_support_access(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute("DELETE FROM support_access WHERE user_id=?", (user_id,))
+            await db.execute("DELETE FROM support_sessions WHERE user_id=?", (user_id,))
+            await db.execute("DELETE FROM support_links WHERE user_id=?", (user_id,))
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def has_support_access(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("SELECT 1 FROM support_access WHERE user_id=?", (user_id,)) as cur:
+                return await cur.fetchone() is not None
+
+    async def get_support_access_list(self) -> list:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT a.user_id,COALESCE(u.user_name,CAST(a.user_id AS TEXT)),a.granted_at "
+                "FROM support_access a LEFT JOIN user_stats u ON u.user_id=a.user_id AND u.chat_id=? "
+                "ORDER BY a.granted_at DESC",
+                (MAIN_CHAT_ID,),
+            ) as cur:
+                return await cur.fetchall()
+
+    async def set_support_session(self, user_id: int, active: bool) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO support_sessions(user_id,active,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET active=excluded.active,updated_at=excluded.updated_at",
+                (user_id, int(active), time.time()),
+            )
+            await db.commit()
+
+    async def is_support_session_active(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT 1 FROM support_sessions s JOIN support_access a ON a.user_id=s.user_id "
+                "WHERE s.user_id=? AND s.active=1",
+                (user_id,),
+            ) as cur:
+                return await cur.fetchone() is not None
+
+    async def link_support_message(self, admin_message_id: int, user_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO support_links(admin_message_id,user_id,created_at) VALUES (?,?,?)",
+                (admin_message_id, user_id, time.time()),
+            )
+            await db.commit()
+
+    async def get_support_user_by_admin_message(self, admin_message_id: int) -> int | None:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT user_id FROM support_links WHERE admin_message_id=?",
+                (admin_message_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row[0]) if row else None
 
     async def create_bonus_broadcast(self, amount: int) -> tuple[int, int]:
         async with aiosqlite.connect(self.path, timeout=30) as db:
@@ -1964,6 +2051,7 @@ PLAIN_COMMANDS = {
     "stats", "top", "winstop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
     "roulette", "dice", "mines", "duel", "exchange", "admin", "broadcast",
+    "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 
 RUSSIAN_COMMANDS = {
@@ -1978,6 +2066,8 @@ RUSSIAN_COMMANDS = {
     "добавитьвизуал": "addvisual", "убратьвизуал": "removevisual",
     "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
     "раздать": "broadcast",
+    "датьдоступ": "supportgrant", "убратьдоступ": "supportrevoke",
+    "доступы": "supportlist", "ответ": "supportreply", "закрытьчат": "supportclose",
 }
 
 def parse_plain_command(text: str | None):
@@ -1997,7 +2087,7 @@ def parse_plain_command(text: str | None):
 def is_plain_command(message: Message) -> bool:
     return parse_plain_command(message.text) is not None
 
-def start_keyboard(is_admin: bool = False):
+def start_keyboard(is_admin: bool = False, support_access: bool = False):
     buttons = [
         [InlineKeyboardButton(text="🏫 Школьный ивент", callback_data="school:boss")],
         [InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"), InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0")],
@@ -2005,6 +2095,8 @@ def start_keyboard(is_admin: bool = False):
         [InlineKeyboardButton(text="⭐ Купить D-COINS", callback_data="buy_dc_menu")],
         [InlineKeyboardButton(text="❓ Как играть", callback_data="help")],
     ]
+    if support_access:
+        buttons.append([InlineKeyboardButton(text="💬 Чат с администратором", callback_data="support_open")])
     if is_admin:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -2090,9 +2182,10 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     if not await is_channel_subscriber(bot, message.from_user.id):
         await send_subscription_prompt(message)
         return
+    support_access = await db.has_support_access(message.from_user.id)
     await message.answer(
         "👋 Добро пожаловать!\n\nВыберите действие:",
-        reply_markup=start_keyboard(message.from_user.id == ADMIN_ID)
+        reply_markup=start_keyboard(message.from_user.id == ADMIN_ID, support_access)
     )
 
 @router.callback_query(F.data == "check_subscription")
@@ -2101,11 +2194,161 @@ async def check_subscription(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("❌ Подписка пока не найдена.", show_alert=True)
         return
     await db.register_bot_user(callback.from_user.id, display_name(callback.from_user))
+    support_access = await db.has_support_access(callback.from_user.id)
     await callback.message.edit_text(
         "👋 Добро пожаловать!\n\nВыберите действие:",
-        reply_markup=start_keyboard(callback.from_user.id == ADMIN_ID),
+        reply_markup=start_keyboard(callback.from_user.id == ADMIN_ID, support_access),
     )
     await callback.answer("✅ Подписка подтверждена")
+
+
+def support_chat_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Закрыть диалог", callback_data="support_close")],
+    ])
+
+
+@router.callback_query(F.data == "support_open")
+async def support_open_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    if await db.is_banned(user_id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    if not await db.has_support_access(user_id):
+        await callback.answer("❌ У тебя нет доступа к чату с администратором.", show_alert=True)
+        return
+    if not await is_channel_subscriber(bot, user_id):
+        await callback.answer("❌ Сначала подпишись на канал.", show_alert=True)
+        return
+    await db.set_support_session(user_id, True)
+    await callback.message.answer(
+        "💬 Диалог с администратором открыт.\n\n"
+        "Теперь отправляй сюда сообщения, фото, видео, документы или голосовые — администратор ответит через бота.\n\n"
+        "⚠️ Никогда не отправляй коды входа Telegram, пароль 2FA или строку сессии.",
+        reply_markup=support_chat_keyboard(),
+    )
+    await callback.answer("Диалог открыт")
+
+
+@router.callback_query(F.data == "support_close")
+async def support_close_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    await db.set_support_session(user_id, False)
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔒 Пользователь {display_name(callback.from_user)} ({user_id}) закрыл диалог.",
+        )
+    except Exception as error:
+        logger.warning("Could not notify admin about closed support chat: %s", error)
+    await callback.message.edit_text("🔒 Диалог с администратором закрыт.")
+    await callback.answer("Диалог закрыт")
+
+
+async def parse_support_user_id(message: Message, usage: str) -> int | None:
+    args = (message.text or "").split()
+    if len(args) < 2:
+        await message.answer(usage)
+        return None
+    try:
+        return int(args[1])
+    except ValueError:
+        await message.answer("❌ Укажи числовой ID пользователя.")
+        return None
+
+
+@router.message(Command("supportgrant"), F.chat.type == "private")
+async def cmd_supportgrant(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    user_id = await parse_support_user_id(message, "Использование: supportgrant ID")
+    if user_id is None:
+        return
+    await db.grant_support_access(user_id)
+    name = await db.get_user_name(user_id)
+    await message.answer(f"✅ Доступ к чату выдан: {name} ({user_id}).")
+    try:
+        await bot.send_message(
+            user_id,
+            "✅ Тебе открыт доступ к чату с администратором.\n\n"
+            "⚠️ Не отправляй коды входа Telegram, пароль 2FA или строку сессии.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Открыть диалог", callback_data="support_open")],
+            ]),
+        )
+    except Exception as error:
+        logger.info("Could not notify support user %s: %s", user_id, error)
+
+
+@router.message(Command("supportrevoke"), F.chat.type == "private")
+async def cmd_supportrevoke(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    user_id = await parse_support_user_id(message, "Использование: supportrevoke ID")
+    if user_id is None:
+        return
+    removed = await db.revoke_support_access(user_id)
+    await message.answer("✅ Доступ отозван, диалог закрыт." if removed else "ℹ️ У пользователя не было доступа.")
+    if removed:
+        try:
+            await bot.send_message(user_id, "🔒 Администратор закрыл диалог и отозвал доступ.")
+        except Exception as error:
+            logger.info("Could not notify revoked support user %s: %s", user_id, error)
+
+
+@router.message(Command("supportlist"), F.chat.type == "private")
+async def cmd_supportlist(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    users = await db.get_support_access_list()
+    if not users:
+        await message.answer("📭 Доступ к чату никому не выдан.")
+        return
+    text = "💬 Доступ к чату с администратором:\n\n" + "\n".join(
+        f"• {name} — {user_id}" for user_id, name, _ in users
+    )
+    await message.answer(text[:4000])
+
+
+@router.message(Command("supportreply"), F.chat.type == "private")
+async def cmd_supportreply(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = (message.text or "").split(maxsplit=2)
+    if len(args) != 3:
+        await message.answer("Использование: supportreply ID текст")
+        return
+    try:
+        user_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ Укажи числовой ID пользователя.")
+        return
+    if not await db.has_support_access(user_id):
+        await message.answer("❌ У пользователя нет доступа к чату.")
+        return
+    if not await db.is_support_session_active(user_id):
+        await message.answer("❌ Пользователь закрыл диалог.")
+        return
+    try:
+        await bot.send_message(user_id, f"💬 Администратор:\n\n{args[2]}", reply_markup=support_chat_keyboard())
+        await message.answer("✅ Ответ отправлен.")
+    except Exception as error:
+        await message.answer(f"❌ Не удалось отправить ответ: {error}")
+
+
+@router.message(Command("supportclose"), F.chat.type == "private")
+async def cmd_supportclose(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    user_id = await parse_support_user_id(message, "Использование: supportclose ID")
+    if user_id is None:
+        return
+    await db.set_support_session(user_id, False)
+    await message.answer(f"🔒 Диалог с {user_id} закрыт.")
+    try:
+        await bot.send_message(user_id, "🔒 Администратор закрыл диалог.")
+    except Exception as error:
+        logger.info("Could not notify closed support user %s: %s", user_id, error)
 
 async def send_help(message: Message) -> None:
     await message.answer(
@@ -3347,6 +3590,8 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
         "🛠 Основные админ-команды\n\n"
         "addcoins ID СУММА / removecoins ID СУММА\n"
         "addvisual ID СУММА / removevisual ID СУММА\n"
+        "датьдоступ ID / убратьдоступ ID / доступы\n"
+        "ответ ID ТЕКСТ / закрытьчат ID\n"
         "addmsgs ID КОЛ-ВО / removemsgs ID КОЛ-ВО\n"
         "vip ID / unvip ID / ban ID ПРИЧИНА / unban ID\n"
         "createpromo КОД DC [ЛИМИТ] [скрытый]\n"
@@ -4714,12 +4959,14 @@ PRIVATE_PLAIN_COMMANDS = {
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "promo", "cases", "slots", "roulette", "dice", "mines", "admin", "broadcast",
+    "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "say", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
     "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "admin",
+    "supportgrant", "supportrevoke", "supportreply", "supportclose",
 }
 PLAIN_COMMAND_HANDLERS = {
     "start": cmd_start, "help": cmd_help,
@@ -4742,10 +4989,23 @@ PLAIN_COMMAND_HANDLERS = {
     "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines,
     "duel": cmd_duel, "exchange": cmd_exchange, "admin": cmd_admin,
     "broadcast": cmd_broadcast,
+    "supportgrant": cmd_supportgrant, "supportrevoke": cmd_supportrevoke,
+    "supportlist": cmd_supportlist, "supportreply": cmd_supportreply,
+    "supportclose": cmd_supportclose,
 }
 
 @router.message(is_plain_command)
 async def plain_command_handler(message: Message, bot: Bot) -> None:
+    # Пока открыт диалог, обычные слова считаются сообщением администратору,
+    # даже если совпадают с командами вроде «баланс» или «бонус».
+    if (
+        message.chat.type == "private"
+        and message.from_user
+        and message.from_user.id != ADMIN_ID
+        and await db.is_support_session_active(message.from_user.id)
+    ):
+        await support_user_message_handler(message, bot)
+        return
     parsed = parse_plain_command(message.text)
     if not parsed:
         return
@@ -4765,6 +5025,70 @@ async def plain_command_handler(message: Message, bot: Bot) -> None:
         await handler(command_message, bot)
     else:
         await handler(command_message)
+
+
+@router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID)
+async def support_admin_reply_handler(message: Message, bot: Bot) -> None:
+    """Администратор отвечает реплаем на любое сообщение диалога."""
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if not message.reply_to_message:
+        return
+    user_id = await db.get_support_user_by_admin_message(message.reply_to_message.message_id)
+    if user_id is None:
+        return
+    if not await db.has_support_access(user_id):
+        await message.answer("❌ Доступ пользователя уже отозван.")
+        return
+    if not await db.is_support_session_active(user_id):
+        await message.answer("❌ Пользователь уже закрыл диалог.")
+        return
+    try:
+        await bot.send_message(user_id, "💬 Ответ администратора:", reply_markup=support_chat_keyboard())
+        await bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await db.link_support_message(message.message_id, user_id)
+        await message.answer("✅ Ответ отправлен пользователю.")
+    except Exception as error:
+        await message.answer(f"❌ Не удалось отправить ответ: {error}")
+
+
+@router.message(F.chat.type == "private")
+async def support_user_message_handler(message: Message, bot: Bot) -> None:
+    """Пересылает все типы сообщений активного разрешённого диалога админу."""
+    if not message.from_user or message.from_user.id == ADMIN_ID or message.from_user.is_bot:
+        return
+    user_id = message.from_user.id
+    if not await db.has_support_access(user_id):
+        return
+    if not await db.is_support_session_active(user_id):
+        return
+    if await db.is_banned(user_id):
+        return
+    username = f"@{message.from_user.username}" if message.from_user.username else "без username"
+    try:
+        header = await bot.send_message(
+            ADMIN_ID,
+            "💬 Сообщение из диалога\n\n"
+            f"👤 {display_name(message.from_user)}\n"
+            f"🔗 {username}\n"
+            f"🆔 {user_id}\n\n"
+            "Ответь реплаем на это сообщение или на сообщение ниже.",
+        )
+        copied = await bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await db.link_support_message(header.message_id, user_id)
+        await db.link_support_message(copied.message_id, user_id)
+        await message.answer("✅ Сообщение доставлено администратору.", reply_markup=support_chat_keyboard())
+    except Exception as error:
+        logger.exception("Support relay failed for %s", user_id)
+        await message.answer(f"❌ Не удалось доставить сообщение: {error}")
 
 # =========================
 # MAIN GROUP HANDLER
