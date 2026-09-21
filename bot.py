@@ -67,6 +67,20 @@ GAME_BET_PRESETS = (100, 500, 1000, 2500, 5000, 10000, 50000, 100000)
 SCRATCH_SYMBOLS = ("🌈", "🔥", "🍓", "🍒", "🍋", "💎")
 SCRATCH_WIN_CHANCE = 0.30
 SCRATCH_MULTIPLIER = 3
+LOTTERY_MULTIPLIERS = (
+    [3.0] + [2.5] + [2.0] * 3 + [1.5] * 5 +
+    [1.0] * 3 + [0.5] * 2 + [0.0] * 10
+)
+PANDORA_COOLDOWN = 5 * 86400
+PANDORA_REWARDS = (
+    ("coins", 1_000, 22), ("coins", 3_000, 18), ("coins", 5_000, 14),
+    ("coins", 10_000, 10), ("coins", 25_000, 5), ("coins", 50_000, 1),
+    ("key", "school", 8), ("key", "student", 6), ("key", "blood", 5),
+    ("key", "spider_man", 4), ("key", "pantera", 3), ("key", "excellent", 1),
+    ("chance", 1.0, 2),
+    ("gift", 15, 0.60), ("gift", 25, 0.25), ("gift", 50, 0.10),
+    ("gift", 100, 0.04), ("premium", 1, 0.01),
+)
 
 # Дуэли в основном чате
 DUEL_MIN_BET       = 5
@@ -188,6 +202,8 @@ WIN_GIFT_IDS = [
 
 # Активные игры казино: user_id -> {"game": str, "bet": int, "data": dict, "expires": float}
 active_games: dict = {}
+# Ожидание произвольной ставки после выбора игры инлайн-кнопками.
+pending_game_bets: dict[int, dict] = {}
 # Активные дуэли: duel_id -> данные дуэли; пользователь может находиться только в одной.
 active_duels: dict[str, dict] = {}
 duel_by_user: dict[int, str] = {}
@@ -328,6 +344,12 @@ class Database:
                 )
             """)
             await db.execute("""
+                CREATE TABLE IF NOT EXISTS pandora_claims (
+                    user_id     INTEGER PRIMARY KEY,
+                    last_opened REAL NOT NULL
+                )
+            """)
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS bot_users (
                     user_id    INTEGER PRIMARY KEY,
                     user_name  TEXT,
@@ -338,9 +360,17 @@ class Database:
                 CREATE TABLE IF NOT EXISTS bonus_broadcasts (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
                     amount     INTEGER NOT NULL,
+                    reward_type TEXT NOT NULL DEFAULT 'coins',
+                    case_id     TEXT,
                     created_at REAL NOT NULL
                 )
             """)
+            async with db.execute("PRAGMA table_info(bonus_broadcasts)") as cur:
+                broadcast_columns = {row[1] for row in await cur.fetchall()}
+            if "reward_type" not in broadcast_columns:
+                await db.execute("ALTER TABLE bonus_broadcasts ADD COLUMN reward_type TEXT NOT NULL DEFAULT 'coins'")
+            if "case_id" not in broadcast_columns:
+                await db.execute("ALTER TABLE bonus_broadcasts ADD COLUMN case_id TEXT")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS bonus_deliveries (
                     broadcast_id INTEGER NOT NULL,
@@ -956,6 +986,52 @@ class Database:
                 row = await cur.fetchone()
         return row[0] if row else 0
 
+    async def add_case_keys(self, user_id: int, case_id: str, amount: int = 1) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO case_keys(user_id,case_id,amount) VALUES (?,?,?) "
+                "ON CONFLICT(user_id,case_id) DO UPDATE SET amount=amount+excluded.amount",
+                (user_id, case_id, amount),
+            )
+            await db.commit()
+        return await self.get_case_keys(user_id, case_id)
+
+    async def pandora_remaining(self, user_id: int, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT last_opened FROM pandora_claims WHERE user_id=?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return 0
+        return max(0, int(PANDORA_COOLDOWN - (now - row[0]) + 0.999))
+
+    async def claim_pandora(self, user_id: int, now: float | None = None) -> tuple[bool, int]:
+        """Атомарно фиксирует бесплатное открытие, не позволяя двойной клик."""
+        now = time.time() if now is None else now
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT last_opened FROM pandora_claims WHERE user_id=?", (user_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                if row and now - row[0] < PANDORA_COOLDOWN:
+                    remaining = max(1, int(PANDORA_COOLDOWN - (now - row[0]) + 0.999))
+                    await db.rollback()
+                    return False, remaining
+                await db.execute(
+                    "INSERT INTO pandora_claims(user_id,last_opened) VALUES (?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET last_opened=excluded.last_opened",
+                    (user_id, now),
+                )
+                await db.commit()
+                return True, 0
+            except Exception:
+                await db.rollback()
+                raise
+
     async def register_bot_user(self, user_id: int, user_name: str) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
@@ -1048,6 +1124,36 @@ class Database:
                         "INSERT INTO coins(user_id,balance) VALUES (?,?) "
                         "ON CONFLICT(user_id) DO UPDATE SET balance=balance+?",
                         (user_id, COINS_START + amount, amount),
+                    )
+                    await db.execute(
+                        "INSERT INTO bonus_deliveries(broadcast_id,user_id) VALUES (?,?)",
+                        (broadcast_id, user_id),
+                    )
+                await db.commit()
+                return broadcast_id, len(users)
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def create_case_broadcast(self, case_id: str, amount: int = 1) -> tuple[int, int]:
+        if case_id not in CASES or amount <= 0:
+            raise ValueError("Invalid case broadcast")
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute("SELECT user_id FROM bot_users ORDER BY user_id") as cur:
+                    users = [row[0] for row in await cur.fetchall()]
+                cur = await db.execute(
+                    "INSERT INTO bonus_broadcasts(amount,reward_type,case_id,created_at) "
+                    "VALUES (?,'case',?,?)",
+                    (amount, case_id, time.time()),
+                )
+                broadcast_id = cur.lastrowid
+                for user_id in users:
+                    await db.execute(
+                        "INSERT INTO case_keys(user_id,case_id,amount) VALUES (?,?,?) "
+                        "ON CONFLICT(user_id,case_id) DO UPDATE SET amount=amount+excluded.amount",
+                        (user_id, case_id, amount),
                     )
                     await db.execute(
                         "INSERT INTO bonus_deliveries(broadcast_id,user_id) VALUES (?,?)",
@@ -1529,7 +1635,7 @@ class SchoolEvent:
             streak = previous[0] % 5 + 1 if previous else 1
             await c.execute("INSERT OR IGNORE INTO school_days(season,uid,day,streak) VALUES (?,?,?,?)", (season, uid, day, streak))
 
-    async def record(self, uid, name, token, metrics=None, loss=0, now=None):
+    async def record(self, uid, name, token, metrics=None, loss=0, now=None, manual=False):
         now = time.time() if now is None else now
         async with self.transaction() as c:
             season = await self.current(c, now)
@@ -1539,21 +1645,23 @@ class SchoolEvent:
             cur = await c.execute("INSERT OR IGNORE INTO school_actions(season,uid,token) VALUES (?,?,?)", (sid, uid, token))
             if cur.rowcount != 1:
                 return 0, 0
-            day = await self.prepare(c, sid, uid, name, now)
-            await self.progress(c, sid, uid, name, day, now, metrics or {})
+            if not manual:
+                day = await self.prepare(c, sid, uid, name, now)
+                await self.progress(c, sid, uid, name, day, now, metrics or {})
             damage = refund = 0
             if loss > 0 and season["hp"] > 0:
                 damage = min(int(loss), season["hp"])
                 refund = int(loss) - damage
-                await c.execute("UPDATE school_players SET damage=damage+?, reached=? WHERE season=? AND uid=?", (damage, now, sid, uid))
+                if not manual:
+                    await c.execute("UPDATE school_players SET damage=damage+?, reached=? WHERE season=? AND uid=?", (damage, now, sid, uid))
                 await c.execute("UPDATE school_seasons SET hp=hp-? WHERE id=?", (damage, sid))
-                if refund:
+                if refund and not manual:
                     await self.coins(c, uid, refund)
 
                 # Редкое перераспределение проигрыша: полный урон остаётся боссу,
                 # а половина реально потерянной суммы начисляется случайному
                 # участнику текущего топ-10 (кроме самого проигравшего).
-                share_chance = loss_share_chance(damage)
+                share_chance = 0 if manual else loss_share_chance(damage)
                 if share_chance and random.random() < share_chance:
                     async with c.execute(
                         "SELECT uid,name FROM school_players WHERE season=? AND damage>0 "
@@ -1591,7 +1699,8 @@ class SchoolEvent:
                             if p["damage"] >= 100000:
                                 rewards.append(("excellent", 1))
                             await self.reward(c, sid, p["uid"], "Архимед: победа над боссом", rewards)
-                        await self.reward(c, sid, uid, "Архимед: последний удар", [("coins", boss["last_hit"])])
+                        if not manual:
+                            await self.reward(c, sid, uid, "Архимед: последний удар", [("coins", boss["last_hit"])])
                         stage_one_prizes = [[("nft", 1)], [("premium", 1)], [("gift", 100)]]
                         for place, p in enumerate(players[:3], 1):
                             await self.reward(c, sid, p["uid"], f"Архимед: топ-{place} по урону", stage_one_prizes[place - 1])
@@ -1601,8 +1710,8 @@ class SchoolEvent:
                                 sid,
                                 "boss:1",
                                 f"🏆 Архимед Знаний побеждён!\n\n{top}\n\n"
-                                f"Последний удар: {name} — {boss['last_hit']:,} DC.\n"
-                                "Рейтинг урона обнулён. Появился новый босс — 🌑 Магистр Забвений с 50 000 000 HP!",
+                                + ((f"Последний удар: {name} — {boss['last_hit']:,} DC.\n") if not manual else "Босс добит вручную администратором.\n")
+                                + "Рейтинг урона обнулён. Появился новый босс — 🌑 Магистр Забвений с 50 000 000 HP!",
                             ),
                         )
                         await c.execute(
@@ -1611,7 +1720,8 @@ class SchoolEvent:
                         )
                         await c.execute("UPDATE school_players SET damage=0,reached=0 WHERE season=?", (sid,))
                     else:
-                        await self.reward(c, sid, uid, "Магистр Забвений: последний удар", [("coins", boss["last_hit"])])
+                        if not manual:
+                            await self.reward(c, sid, uid, "Магистр Забвений: последний удар", [("coins", boss["last_hit"])])
                         for place, p in enumerate(players[:3], 1):
                             await self.reward(c, sid, p["uid"], f"Магистр Забвений: топ-{place} по урону", [("nft", 1)])
                         await c.execute(
@@ -1620,11 +1730,11 @@ class SchoolEvent:
                                 sid,
                                 "boss:2",
                                 f"🏆 Магистр Забвений побеждён!\n\n{top}\n\n"
-                                f"Последний удар: {name} — {boss['last_hit']:,} DC.\n"
-                                "Все игроки из топ-3 получают NFT. Рейтинг зафиксирован!",
+                                + ((f"Последний удар: {name} — {boss['last_hit']:,} DC.\n") if not manual else "Босс добит вручную администратором.\n")
+                                + "Все игроки из топ-3 получают NFT. Рейтинг зафиксирован!",
                             ),
                         )
-            return damage, refund
+            return damage, 0 if manual else refund
 
     async def claim(self, sid, uid, name, category, value):
         async with self.transaction() as c:
@@ -2012,18 +2122,25 @@ async def bonus_notification_worker(bot: Bot) -> None:
             async with aiosqlite.connect(db.path) as conn:
                 conn.row_factory = aiosqlite.Row
                 async with conn.execute(
-                    "SELECT d.broadcast_id,d.user_id,b.amount,d.attempts "
+                    "SELECT d.broadcast_id,d.user_id,b.amount,b.reward_type,b.case_id,d.attempts "
                     "FROM bonus_deliveries d JOIN bonus_broadcasts b ON b.id=d.broadcast_id "
                     "WHERE d.status=0 ORDER BY d.broadcast_id,d.user_id LIMIT 20"
                 ) as cur:
                     rows = await cur.fetchall()
             for row in rows:
                 try:
-                    await bot.send_message(
-                        row["user_id"],
-                        f"🎁 Администратор раздал всем игрокам {row['amount']:,} DC!\n"
-                        "🪙 Монеты уже зачислены на твой баланс.".replace(",", " "),
-                    )
+                    if row["reward_type"] == "case" and row["case_id"] in CASES:
+                        amount_text = f"{row['amount']} ключ" if row["amount"] == 1 else f"{row['amount']} ключа"
+                        notification = (
+                            "🎁 Администратор раздал всем игрокам кейсы!\n"
+                            f"🔑 Тебе начислено: {amount_text} от кейса {CASES[row['case_id']]['title']}."
+                        )
+                    else:
+                        notification = (
+                            f"🎁 Администратор раздал всем игрокам {row['amount']:,} DC!\n"
+                            "🪙 Монеты уже зачислены на твой баланс."
+                        ).replace(",", " ")
+                    await bot.send_message(row["user_id"], notification)
                     status, error = 1, None
                 except Exception as exc:
                     status = 2 if row["attempts"] >= 2 else 0
@@ -2054,7 +2171,7 @@ PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
-    "roulette", "dice", "mines", "scratch", "duel", "exchange", "admin", "broadcast",
+    "roulette", "dice", "mines", "scratch", "coinflip", "lottery", "duel", "exchange", "admin", "bossdamage", "broadcast",
     "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 
@@ -2067,9 +2184,12 @@ RUSSIAN_COMMANDS = {
     "промо": "promo", "перевод": "transfer", "слоты": "slots",
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
     "скретч": "scratch", "скретчкарты": "scratch", "скретч-карты": "scratch",
+    "монетка": "coinflip", "орелрешка": "coinflip", "орёлрешка": "coinflip",
+    "лотерея": "lottery", "лотерея5x5": "lottery",
     "удалитьзаявку": "deletepending",
     "добавитьвизуал": "addvisual", "убратьвизуал": "removevisual",
     "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
+    "уронбоссу": "bossdamage", "ударитьбосса": "bossdamage",
     "раздать": "broadcast",
     "датьдоступ": "supportgrant", "убратьдоступ": "supportrevoke",
     "доступы": "supportlist", "ответ": "supportreply", "закрытьчат": "supportclose",
@@ -2087,6 +2207,9 @@ def parse_plain_command(text: str | None):
     if command == "roulette" and len(parts) > 1:
         colors = {"красное": "red", "красный": "red", "черное": "black", "чёрное": "black", "черный": "black", "чёрный": "black"}
         parts[1] = colors.get(parts[1].lower(), parts[1])
+    if command == "coinflip" and len(parts) > 1:
+        sides = {"орел": "heads", "орёл": "heads", "решка": "tails", "heads": "heads", "tails": "tails"}
+        parts[1] = sides.get(parts[1].lower(), parts[1])
     return command, parts[1:]
 
 def is_plain_command(message: Message) -> bool:
@@ -2154,6 +2277,7 @@ def buy_dc_keyboard() -> InlineKeyboardMarkup:
 
 def cases_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 ЯЩИК ПАНДОРЫ — бесплатно раз в 5 дней", callback_data="pandora_view")],
         [InlineKeyboardButton(text="🎒 ШКОЛЬНЫЙ — 3 000 DC", callback_data="case_view_school")],
         [InlineKeyboardButton(text="🎓 СТУДЕНЧЕСКИЙ — 12 000 DC", callback_data="case_view_student")],
         [InlineKeyboardButton(text="🏆 КЕЙС ОТЛИЧНИКА — только 🔑", callback_data="case_view_excellent")],
@@ -2165,6 +2289,38 @@ def cases_keyboard() -> InlineKeyboardMarkup:
 def case_detail_keyboard(case_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Открыть кейс", callback_data=f"case_open_{case_id}")],
+        [InlineKeyboardButton(text="⬅️ Все кейсы", callback_data="cases")],
+    ])
+
+def format_pandora_wait(seconds: int) -> str:
+    days, remainder = divmod(max(0, seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = (remainder + 59) // 60
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+    if hours == 24:
+        days += 1
+        hours = 0
+    parts = []
+    if days:
+        parts.append(f"{days} д.")
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes or not parts:
+        parts.append(f"{minutes} мин.")
+    return " ".join(parts)
+
+def pandora_keyboard(remaining: int) -> InlineKeyboardMarkup:
+    if remaining <= 0:
+        action = InlineKeyboardButton(text="🎁 Открыть бесплатно", callback_data="pandora_open")
+    else:
+        action = InlineKeyboardButton(
+            text=f"⏳ Через {format_pandora_wait(remaining)}", callback_data="pandora_wait"
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [action],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="pandora_view")],
         [InlineKeyboardButton(text="⬅️ Все кейсы", callback_data="cases")],
     ])
 
@@ -2367,6 +2523,8 @@ async def send_help(message: Message) -> None:
         "• слоты 50\n"
         "• рулетка красное 50\n"
         "• кубик 3 50\n"
+        "• монетка орёл 50\n"
+        "• лотерея 1000\n"
         "• мины 2500\n"
         "• скретч 1000\n"
         "В минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n"
@@ -3037,8 +3195,42 @@ async def cmd_broadcast(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split()
+    if len(parts) >= 3 and parts[1].lower() in {"кейс", "case"}:
+        aliases = {
+            "школьный": "school", "school": "school",
+            "студенческий": "student", "student": "student",
+            "отличника": "excellent", "excellent": "excellent",
+            "blood": "blood", "блад": "blood",
+            "pantera": "pantera", "пантера": "pantera",
+            "spider": "spider_man", "spider_man": "spider_man", "паук": "spider_man",
+        }
+        case_id = aliases.get(parts[2].lower())
+        try:
+            amount = int(parts[3]) if len(parts) >= 4 else 1
+        except ValueError:
+            await message.answer("❌ Количество ключей должно быть целым числом.")
+            return
+        if case_id not in CASES:
+            await message.answer(
+                "❌ Кейс не найден. Доступны: school, student, excellent, blood, pantera, spider_man."
+            )
+            return
+        if amount <= 0 or amount > 100:
+            await message.answer("❌ Можно раздать от 1 до 100 ключей каждому.")
+            return
+        broadcast_id, recipients = await db.create_case_broadcast(case_id, amount)
+        await message.answer(
+            f"✅ Раздача #{broadcast_id} создана.\n"
+            f"🔑 По {amount} ключей кейса {CASES[case_id]['title']} начислено: {recipients} игрокам.\n"
+            "📨 Уведомления отправляются автоматически."
+        )
+        return
     if len(parts) != 2:
-        await message.answer("Использование: раздать СУММА\nПример: раздать 10000")
+        await message.answer(
+            "Раздача DC: раздать СУММА\n"
+            "Раздача кейсов: раздать кейс НАЗВАНИЕ [КОЛИЧЕСТВО]\n\n"
+            "Примеры:\nраздать 10000\nраздать кейс blood 1"
+        )
         return
     try:
         amount = int(parts[1])
@@ -3106,6 +3298,57 @@ async def cmd_admin(message: Message, bot: Bot) -> None:
     if message.from_user.id != ADMIN_ID:
         return
     await message.answer(await admin_dashboard_text(bot), reply_markup=admin_panel_keyboard())
+
+
+@router.message(Command("bossdamage"), F.chat.type == "private")
+async def cmd_bossdamage(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: уронбоссу СУММА\nПример: уронбоссу 100000")
+        return
+    try:
+        amount = int(parts[1].replace("_", ""))
+    except ValueError:
+        await message.answer("❌ Урон должен быть целым числом.")
+        return
+    if amount <= 0 or amount > 1_000_000_000:
+        await message.answer("❌ Урон должен быть от 1 до 1 000 000 000.")
+        return
+    async with school_event.transaction() as connection:
+        before = await school_event.current(connection)
+    if not before or before["hp"] <= 0:
+        await message.answer("❌ Сейчас нет живого активного босса.")
+        return
+    stage_before = int(before["boss_stage"] or 1)
+    hp_before = int(before["hp"])
+    damage, _ = await school_event.record(
+        message.from_user.id,
+        "Администратор",
+        f"admin-damage:{message.chat.id}:{message.message_id}",
+        loss=amount,
+        manual=True,
+    )
+    async with school_event.transaction() as connection:
+        after = await school_event.current(connection, active=False)
+    if not damage or not after:
+        await message.answer("ℹ️ Урон не применён: команда уже использована или ивент завершён.")
+        return
+    boss_name = SCHOOL_BOSSES.get(stage_before, SCHOOL_BOSSES[2])["name"]
+    stage_after = int(after["boss_stage"] or 1)
+    if stage_after != stage_before:
+        next_boss = SCHOOL_BOSSES.get(stage_after, SCHOOL_BOSSES[2])["name"]
+        status = f"🏆 {boss_name} побеждён!\n➡️ Новый босс: {next_boss}\n❤️ HP: {after['hp']:,}"
+    elif after["hp"] <= 0:
+        status = f"🏆 {boss_name} побеждён!"
+    else:
+        status = f"❤️ Осталось: {after['hp']:,} / {after['max_hp']:,} HP"
+    ignored = max(0, amount - hp_before)
+    ignored_text = f"\nℹ️ Лишний урон не учитывался: {ignored:,}." if ignored else ""
+    await message.answer(
+        (f"✅ Боссу вручную нанесено {damage:,} урона.\n{status}{ignored_text}").replace(",", " ")
+    )
 
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel_callback(callback: CallbackQuery, bot: Bot) -> None:
@@ -3607,6 +3850,8 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
         "promos / pending / premiumorders\n"
         "say ТЕКСТ — сообщение в основную группу\n"
         "раздать СУММА — начислить DC всем пользователям бота\n"
+        "раздать кейс НАЗВАНИЕ [КОЛ-ВО] — выдать всем ключи\n"
+        "уронбоссу СУММА — вручную уменьшить HP босса\n"
         "popolnit — пополнить баланс звёзд бота",
         reply_markup=admin_back_keyboard(),
     )
@@ -3901,6 +4146,105 @@ async def send_cases_menu(message: Message, user_id: int) -> None:
         reply_markup=cases_keyboard(),
     )
 
+async def show_pandora(callback: CallbackQuery, notice: str = "") -> None:
+    remaining = await db.pandora_remaining(callback.from_user.id)
+    status = "✅ Можно открыть прямо сейчас!" if remaining <= 0 else f"⏳ Следующее открытие через {format_pandora_wait(remaining)}."
+    text = (
+        "🎁 Ящик Пандоры\n\n"
+        "Один бесплатный ящик для каждого игрока раз в 5 дней.\n\n"
+        "Внутри может быть:\n"
+        "🪙 от 1 000 до 50 000 DC\n"
+        "🔑 ключ от любого кейса\n"
+        "📈 +1% шанса\n"
+        "🎁 Telegram-подарок от 15⭐ до 100⭐\n"
+        "💎 Premium на месяц\n\n"
+        f"{status}"
+    )
+    if notice:
+        text = notice + "\n\n" + text
+    await callback.message.edit_text(text, reply_markup=pandora_keyboard(remaining))
+
+@router.callback_query(F.data == "pandora_view")
+async def pandora_view_callback(callback: CallbackQuery) -> None:
+    if await db.is_banned(callback.from_user.id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    await show_pandora(callback)
+    await callback.answer()
+
+@router.callback_query(F.data == "pandora_wait")
+async def pandora_wait_callback(callback: CallbackQuery) -> None:
+    remaining = await db.pandora_remaining(callback.from_user.id)
+    if remaining <= 0:
+        await show_pandora(callback)
+        await callback.answer("🎁 Ящик уже доступен!")
+    else:
+        await callback.answer(f"Следующее открытие через {format_pandora_wait(remaining)}.", show_alert=True)
+
+@router.callback_query(F.data == "pandora_open")
+async def pandora_open_callback(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    if await db.is_banned(user_id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    claimed, remaining = await db.claim_pandora(user_id)
+    if not claimed:
+        await show_pandora(callback, "ℹ️ Этот Ящик Пандоры уже был открыт.")
+        await callback.answer(f"Следующий через {format_pandora_wait(remaining)}.", show_alert=True)
+        return
+    kind, value, _ = random.choices(
+        PANDORA_REWARDS, weights=[reward[2] for reward in PANDORA_REWARDS], k=1
+    )[0]
+    user_name = display_name(callback.from_user)
+    if kind == "coins":
+        await db.add_coins(user_id, int(value))
+        prize_text = f"🪙 {int(value):,} DC".replace(",", " ")
+    elif kind == "key":
+        await db.add_case_keys(user_id, str(value), 1)
+        prize_text = f"🔑 Ключ от кейса {CASES[str(value)]['title']}"
+    elif kind == "chance":
+        chance, msg_count, last_bonus = await db.get_user(user_id, MAIN_CHAT_ID)
+        new_chance = min(MAX_CHANCE, round(chance + float(value), 3))
+        await db.update_user(user_id, MAIN_CHAT_ID, user_name, new_chance, msg_count, last_bonus)
+        prize_text = f"📈 +{float(value):g}% шанса — теперь {new_chance:.3f}%"
+    elif kind == "gift":
+        gift_key = {15: 5, 25: 10, 50: 15, 100: 20}[int(value)]
+        gift_id = random.choice(GIFT_IDS[gift_key])
+        try:
+            await send_bot_gift(bot, user_id, gift_id)
+            prize_text = f"🎁 Telegram-подарок за {int(value)}⭐ — уже отправлен!"
+        except Exception as error:
+            await db.add_pending_gift(
+                user_id, user_name, gift_id, f"Ящик Пандоры, подарок {int(value)}⭐: {error}"
+            )
+            prize_text = f"🎁 Telegram-подарок за {int(value)}⭐ — добавлен в очередь выдачи."
+    else:
+        order_id = await db.add_premium_order(user_id, user_name, 0)
+        prize_text = f"💎 Premium на месяц — заявка #{order_id} передана администратору!"
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🎁 Ящик Пандоры: выпал Premium\n👤 {user_name} ({user_id})\n📋 Заявка #{order_id}",
+            )
+        except Exception as error:
+            logger.warning("Could not notify admin about Pandora Premium: %s", error)
+    balance = await db.get_display_balance(user_id)
+    remaining = await db.pandora_remaining(user_id)
+    await callback.message.edit_text(
+        (
+            "🎁 Ящик Пандоры открыт!\n\n"
+            f"🎉 Выпало: {prize_text}\n"
+            f"🪙 Баланс: {balance:,} DC\n\n"
+            f"Следующий бесплатный ящик через {format_pandora_wait(remaining)}."
+        ).replace(",", " "),
+        reply_markup=pandora_keyboard(remaining),
+    )
+    await send_game_log(
+        bot,
+        f"🎁 Ящик Пандоры\n👤 {user_name} ({user_id})\n🎉 {prize_text}\n🪙 Баланс: {balance:,} DC".replace(",", " "),
+    )
+    await callback.answer("🎁 Награда получена!")
+
 async def show_case(callback: CallbackQuery, case_id: str) -> None:
     case = CASES[case_id]
     keys = await db.get_case_keys(callback.from_user.id, case_id)
@@ -4042,7 +4386,11 @@ def games_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎲 Кубик", callback_data="game:dice"),
             InlineKeyboardButton(text="💣 Мины", callback_data="game:mines"),
         ],
-        [InlineKeyboardButton(text="🎟 Скретч-карты", callback_data="game:scratch")],
+        [
+            InlineKeyboardButton(text="🪙 Орёл и решка", callback_data="game:coinflip"),
+            InlineKeyboardButton(text="🎟 Скретч-карты", callback_data="game:scratch"),
+        ],
+        [InlineKeyboardButton(text="🎫 Лотерея 5×5", callback_data="game:lottery")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
 
@@ -4063,8 +4411,10 @@ def game_bet_keyboard(game: str, option: str = "-") -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "games")
 async def games_menu(callback: CallbackQuery) -> None:
+    pending_game_bets.pop(callback.from_user.id, None)
     await callback.message.edit_text(
-        "🎮 Игры\n\nВыбери игру. Ставки списываются только с реального баланса.",
+        "🎮 Игры\n\nВыбери игру. После этого бот попросит отправить сумму ставки сообщением.\n"
+        f"Минимальная ставка: {CASINO_MIN_BET} DC. Ставки списываются только с реального баланса.",
         reply_markup=games_keyboard(),
     )
     await callback.answer()
@@ -4072,6 +4422,7 @@ async def games_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "main_menu")
 async def main_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
+    pending_game_bets.pop(callback.from_user.id, None)
     if not await is_channel_subscriber(bot, callback.from_user.id):
         await callback.message.edit_text(
             "📢 Чтобы пользоваться ботом, подпишись на наш канал.",
@@ -4087,24 +4438,48 @@ async def main_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
+async def ask_game_bet(callback: CallbackQuery, game: str, option: str = "-") -> None:
+    names = {
+        "slots": "🎰 Слоты",
+        "mines": "💣 Мины",
+        "scratch": "🎟 Скретч-карты",
+        "roulette": "🎡 Рулетка",
+        "dice": "🎲 Кубик",
+        "coinflip": "🪙 Орёл и решка",
+        "lottery": "🎫 Лотерея 5×5",
+    }
+    details = ""
+    if game == "roulette":
+        details = "\nЦвет: " + ("🔴 красное" if option == "red" else "⚫ чёрное")
+    elif game == "dice":
+        details = f"\nВыбранное число: {option}"
+    elif game == "coinflip":
+        details = "\nВыбрано: " + ("🦅 орёл" if option == "heads" else "🔵 решка")
+    pending_game_bets[callback.from_user.id] = {
+        "game": game,
+        "option": option,
+        "expires": time.time() + 120,
+    }
+    await callback.message.edit_text(
+        f"{names[game]}{details}\n\n"
+        f"✍️ Отправь сумму ставки одним сообщением.\n"
+        f"Минимум: {CASINO_MIN_BET} DC\n\n"
+        "Пример: 13750",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="games")],
+        ]),
+    )
+
+
 @router.callback_query(F.data.startswith("game:"))
 async def game_options_menu(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     game = parts[1] if len(parts) > 1 else ""
     option = parts[2] if len(parts) > 2 else None
-    titles = {
-        "slots": "🎰 Слоты — выбери ставку",
-        "mines": "💣 Мины — выбери ставку",
-        "scratch": "🎟 Скретч-карты — выбери ставку",
-    }
-    if game in titles:
-        await callback.message.edit_text(titles[game], reply_markup=game_bet_keyboard(game))
+    if game in {"slots", "mines", "scratch", "lottery"}:
+        await ask_game_bet(callback, game)
     elif game == "roulette" and option in {"red", "black"}:
-        color = "🔴 красное" if option == "red" else "⚫ чёрное"
-        await callback.message.edit_text(
-            f"🎡 Рулетка\nВыбрано: {color}\n\nВыбери ставку:",
-            reply_markup=game_bet_keyboard(game, option),
-        )
+        await ask_game_bet(callback, game, option)
     elif game == "roulette":
         await callback.message.edit_text(
             "🎡 Рулетка\n\nВыбери цвет:",
@@ -4115,10 +4490,7 @@ async def game_options_menu(callback: CallbackQuery) -> None:
             ]),
         )
     elif game == "dice" and option in {"1", "2", "3", "4", "5", "6"}:
-        await callback.message.edit_text(
-            f"🎲 Кубик\nВыбрано число: {option}\n\nВыбери ставку:",
-            reply_markup=game_bet_keyboard(game, option),
-        )
+        await ask_game_bet(callback, game, option)
     elif game == "dice":
         await callback.message.edit_text(
             "🎲 Кубик\n\nКакое число выпадет?",
@@ -4128,10 +4500,85 @@ async def game_options_menu(callback: CallbackQuery) -> None:
                 [InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")],
             ]),
         )
+    elif game == "coinflip" and option in {"heads", "tails"}:
+        await ask_game_bet(callback, game, option)
+    elif game == "coinflip":
+        await callback.message.edit_text(
+            "🪙 Орёл и решка\n\nВыбери сторону:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🦅 Орёл", callback_data="game:coinflip:heads"),
+                 InlineKeyboardButton(text="🔵 Решка", callback_data="game:coinflip:tails")],
+                [InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")],
+            ]),
+        )
     else:
         await callback.answer("Игра не найдена.", show_alert=True)
         return
     await callback.answer()
+
+
+async def launch_selected_game(message: Message, bot: Bot, game: str, option: str, bet: int) -> None:
+    commands = {
+        "slots": f"/slots {bet}",
+        "mines": f"/mines {bet}",
+        "scratch": f"/scratch {bet}",
+        "roulette": f"/roulette {option} {bet}",
+        "dice": f"/dice {option} {bet}",
+        "coinflip": f"/coinflip {option} {bet}",
+        "lottery": f"/lottery {bet}",
+    }
+    command = commands.get(game)
+    if command is None:
+        await message.reply("❌ Игра не найдена.")
+        return
+    game_message = message.model_copy(update={"text": command})
+    if game == "mines":
+        await cmd_mines(game_message)
+    elif game == "scratch":
+        await cmd_scratch(game_message, bot)
+    elif game == "slots":
+        await cmd_slots(game_message, bot)
+    elif game == "roulette":
+        await cmd_roulette(game_message, bot)
+    elif game == "coinflip":
+        await cmd_coinflip(game_message, bot)
+    elif game == "lottery":
+        await cmd_lottery(game_message, bot)
+    else:
+        await cmd_dice(game_message, bot)
+
+
+def has_pending_game_bet(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id in pending_game_bets)
+
+
+@router.message(F.chat.type == "private", has_pending_game_bet)
+async def receive_inline_game_bet(message: Message, bot: Bot) -> None:
+    pending = pending_game_bets.get(message.from_user.id)
+    if not pending:
+        return
+    if pending["expires"] < time.time():
+        pending_game_bets.pop(message.from_user.id, None)
+        await message.reply("⌛ Время выбора ставки вышло. Открой раздел «🎮 Игры» заново.")
+        return
+    text = (message.text or "").strip()
+    if text.lower() in {"отмена", "cancel"}:
+        pending_game_bets.pop(message.from_user.id, None)
+        await message.reply("❌ Выбор ставки отменён.", reply_markup=games_keyboard())
+        return
+    normalized = text.replace(" ", "").replace("_", "")
+    if not normalized.isdigit():
+        await message.reply("❌ Отправь только сумму числом. Например: 13750\nДля отмены напиши: отмена")
+        return
+    bet = int(normalized)
+    if bet < CASINO_MIN_BET:
+        await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC. Отправь другую сумму.")
+        return
+    if bet > 1_000_000_000:
+        await message.reply("❌ Максимальная ставка: 1 000 000 000 DC. Отправь другую сумму.")
+        return
+    pending_game_bets.pop(message.from_user.id, None)
+    await launch_selected_game(message, bot, pending["game"], pending["option"], bet)
 
 
 @router.callback_query(F.data.startswith("gb:"))
@@ -4151,29 +4598,15 @@ async def inline_game_bet(callback: CallbackQuery, bot: Bot) -> None:
     if game == "dice" and option not in {"1", "2", "3", "4", "5", "6"}:
         await callback.answer("Сначала выбери число.", show_alert=True)
         return
-    commands = {
-        "slots": f"/slots {bet}",
-        "mines": f"/mines {bet}",
-        "scratch": f"/scratch {bet}",
-        "roulette": f"/roulette {option} {bet}",
-        "dice": f"/dice {option} {bet}",
-    }
-    command = commands.get(game)
-    if command is None:
+    if game == "coinflip" and option not in {"heads", "tails"}:
+        await callback.answer("Сначала выбери сторону.", show_alert=True)
+        return
+    if game not in {"slots", "mines", "scratch", "roulette", "dice", "coinflip", "lottery"}:
         await callback.answer("Игра не найдена.", show_alert=True)
         return
     await callback.answer("🎮 Запускаю игру")
-    message = callback.message.model_copy(update={"from_user": callback.from_user, "text": command})
-    if game == "mines":
-        await cmd_mines(message)
-    elif game == "scratch":
-        await cmd_scratch(message, bot)
-    elif game == "slots":
-        await cmd_slots(message, bot)
-    elif game == "roulette":
-        await cmd_roulette(message, bot)
-    else:
-        await cmd_dice(message, bot)
+    message = callback.message.model_copy(update={"from_user": callback.from_user})
+    await launch_selected_game(message, bot, game, option, bet)
 
 # =========================
 # GROUP — CASINO
@@ -4399,6 +4832,84 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
             f"🪙 Баланс: {new_balance} DC{boss_note}"
         )
         await send_game_log(bot, f"🎲 Кубик\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {number}\nВыпало: {rolled}\n❌ Проигрыш\n🪙 Баланс: {new_balance} DC")
+
+
+# =========================
+# PRIVATE — COIN FLIP
+# =========================
+
+@router.message(Command("coinflip"))
+async def cmd_coinflip(message: Message, bot: Bot) -> None:
+    if message.chat.type != "private":
+        return
+    if await db.is_banned(message.from_user.id):
+        await message.reply(BAN_MESSAGE)
+        return
+    user_id = message.from_user.id
+    if user_id in active_games:
+        await message.reply("🎰 У тебя уже есть активная игра! Сначала заверши её.")
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.reply("Использование: монетка орёл/решка ставка\nПример: монетка орёл 1000")
+        return
+    side = args[1].lower()
+    aliases = {"орел": "heads", "орёл": "heads", "решка": "tails", "heads": "heads", "tails": "tails"}
+    side = aliases.get(side, side)
+    if side not in {"heads", "tails"}:
+        await message.reply("❌ Выбери сторону: орёл или решка.")
+        return
+    try:
+        bet = int(args[2])
+    except ValueError:
+        await message.reply("❌ Ставка должна быть числом.")
+        return
+    if bet < CASINO_MIN_BET:
+        await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
+        return
+    balance, _ = await db.get_coins(user_id)
+    if balance < bet:
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        return
+    if user_id in casino_bet_cooldowns:
+        await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
+        return
+    casino_bet_cooldowns[user_id] = True
+    if not await db.remove_coins(user_id, bet):
+        casino_bet_cooldowns.pop(user_id, None)
+        balance, _ = await db.get_coins(user_id)
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        return
+    result = random.choice(("heads", "tails"))
+    result_text = "🦅 Орёл" if result == "heads" else "🔵 Решка"
+    chosen_text = "🦅 Орёл" if side == "heads" else "🔵 Решка"
+    if result == side:
+        prize = bet * 2
+        await db.add_coins(user_id, prize)
+        await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, True)
+        balance_after = await db.get_display_balance(user_id)
+        text = (
+            f"🪙 Выпало: {result_text}\n\n✅ Ты выиграл!\n"
+            f"💸 Ставка: {bet:,} DC на {chosen_text}\n"
+            f"🏆 Выигрыш: {prize:,} DC\n🪙 Баланс: {balance_after:,} DC"
+        ).replace(",", " ")
+        log_result = f"✅ Выигрыш: {prize} DC"
+    else:
+        boss_note = await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, False)
+        balance_after = await db.get_display_balance(user_id)
+        text = (
+            f"🪙 Выпало: {result_text}\n\n❌ Ты проиграл.\n"
+            f"💸 Ставка: {bet:,} DC на {chosen_text}\n"
+            f"🪙 Баланс: {balance_after:,} DC{boss_note}"
+        ).replace(",", " ")
+        log_result = "❌ Проигрыш"
+    await message.reply(text)
+    await send_game_log(
+        bot,
+        f"🪙 Орёл и решка\n👤 {display_name(message.from_user)} ({user_id})\n"
+        f"💸 Ставка: {bet} DC на {chosen_text}\nВыпало: {result_text}\n"
+        f"{log_result}\n🪙 Баланс: {balance_after} DC",
+    )
 
 
 # =========================
@@ -4660,8 +5171,36 @@ def scratch_text(game: dict) -> str:
     ).replace(",", " ")
 
 
+async def settle_scratch(user, game: dict) -> tuple[str, str, int]:
+    user_id = user.id
+    game["opened"] = set(range(9))
+    if game["win"]:
+        prize = game["bet"] * SCRATCH_MULTIPLIER
+        await db.add_coins(user_id, prize)
+        await school_game(user, f"scratch:{game['token']}", game["bet"], True)
+        balance = await db.get_display_balance(user_id)
+        result = (
+            "🎟 Скретч-карты\n\n"
+            "🎉 ПОБЕДА! Найдены 3 одинаковых символа.\n"
+            f"💰 Выигрыш: {prize:,} DC (×{SCRATCH_MULTIPLIER})\n"
+            f"🪙 Баланс: {balance:,} DC"
+        ).replace(",", " ")
+        log_result = f"✅ Выигрыш: {prize} DC"
+    else:
+        boss_note = await school_game(user, f"scratch:{game['token']}", game["bet"], False)
+        balance = await db.get_display_balance(user_id)
+        result = (
+            "🎟 Скретч-карты\n\n"
+            "❌ Трёх одинаковых символов нет. Ты проиграл.\n"
+            f"💸 Ставка: {game['bet']:,} DC\n"
+            f"🪙 Баланс: {balance:,} DC{boss_note}"
+        ).replace(",", " ")
+        log_result = "❌ Проигрыш"
+    return result, log_result, balance
+
+
 @serialized_game
-async def start_scratch_game(message: Message) -> None:
+async def start_scratch_game(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
     if await db.is_banned(user_id):
         await message.reply(BAN_MESSAGE)
@@ -4695,50 +5234,32 @@ async def start_scratch_game(message: Message) -> None:
         "token": secrets.token_hex(12),
         "bet": bet,
         "board": create_scratch_board(win),
-        "opened": set(),
+        "opened": set(range(9)),
         "win": win,
         "balance": await db.get_display_balance(user_id),
         "chat_id": message.chat.id,
         "expires": time.time() + CASINO_TIMEOUT,
     }
-    active_games[user_id] = game
-    sent = await message.reply(scratch_text(game), reply_markup=scratch_keyboard(game))
-    game["message_id"] = sent.message_id
+    result, log_result, balance = await settle_scratch(message.from_user, game)
+    await message.reply(result, reply_markup=scratch_keyboard(game, reveal=True))
+    await send_game_log(
+        bot,
+        f"🎟 Скретч-карты\n👤 {display_name(message.from_user)} ({user_id})\n"
+        f"💸 Ставка: {bet} DC\n{log_result}\n🪙 Баланс: {balance} DC",
+    )
 
 
 @router.message(Command("scratch"))
 async def cmd_scratch(message: Message, bot: Bot) -> None:
     if message.chat.type != "private":
         return
-    await start_scratch_game(message)
+    await start_scratch_game(message, bot)
 
 
 async def finish_scratch_game(callback: CallbackQuery, bot: Bot, game: dict) -> None:
     user_id = callback.from_user.id
     active_games.pop(user_id, None)
-    game["opened"] = set(range(9))
-    if game["win"]:
-        prize = game["bet"] * SCRATCH_MULTIPLIER
-        await db.add_coins(user_id, prize)
-        await school_game(callback.from_user, f"scratch:{game['token']}", game["bet"], True)
-        balance = await db.get_display_balance(user_id)
-        result = (
-            "🎟 Скретч-карты\n\n"
-            "🎉 ПОБЕДА! Найдены 3 одинаковых символа.\n"
-            f"💰 Выигрыш: {prize:,} DC (×{SCRATCH_MULTIPLIER})\n"
-            f"🪙 Баланс: {balance:,} DC"
-        ).replace(",", " ")
-        log_result = f"✅ Выигрыш: {prize} DC"
-    else:
-        boss_note = await school_game(callback.from_user, f"scratch:{game['token']}", game["bet"], False)
-        balance = await db.get_display_balance(user_id)
-        result = (
-            "🎟 Скретч-карты\n\n"
-            "❌ Трёх одинаковых символов нет. Ты проиграл.\n"
-            f"💸 Ставка: {game['bet']:,} DC\n"
-            f"🪙 Баланс: {balance:,} DC{boss_note}"
-        ).replace(",", " ")
-        log_result = "❌ Проигрыш"
+    result, log_result, balance = await settle_scratch(callback.from_user, game)
     await callback.message.edit_text(result, reply_markup=scratch_keyboard(game, reveal=True))
     await send_game_log(
         bot,
@@ -4791,6 +5312,182 @@ async def scratch_reveal(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "scratch_done")
 async def scratch_done(callback: CallbackQuery) -> None:
+    await callback.answer("Игра уже завершена.")
+
+
+# =========================
+# PRIVATE — LOTTERY 5x5
+# =========================
+
+def lottery_multiplier_text(multiplier: float) -> str:
+    return f"×{multiplier:g}".replace(".", ",")
+
+
+def lottery_keyboard(game: dict, reveal: bool = False, selected: int | None = None) -> InlineKeyboardMarkup:
+    buttons = []
+    for row in range(5):
+        line = []
+        for column in range(5):
+            cell = row * 5 + column
+            if not reveal:
+                text, data = "🎟", f"lottery_cell_{cell}"
+            else:
+                multiplier = game["board"][cell]
+                if cell == selected:
+                    text = "❌" if multiplier == 0 else f"🎯{lottery_multiplier_text(multiplier)}"
+                else:
+                    text = lottery_multiplier_text(multiplier)
+                data = "lottery_done"
+            line.append(InlineKeyboardButton(text=text, callback_data=data))
+        buttons.append(line)
+    if reveal:
+        buttons.append([InlineKeyboardButton(text="🔄 Играть ещё", callback_data="game:lottery")])
+        buttons.append([InlineKeyboardButton(text="🎮 Все игры", callback_data="games")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def lottery_text(game: dict) -> str:
+    bet_text = f"{game['bet']:,}".replace(",", " ")
+    return (
+        "🎫 Лотерея 5×5\n\n"
+        f"💸 Ставка: {bet_text} DC\n"
+        "Попробуй угадать, в каком билете находится самый большой коэффициент!\n\n"
+        "На поле: ×3 — 1 · ×2,5 — 1 · ×2 — 3 · ×1,5 — 5\n"
+        "×1 — 3 · ×0,5 — 2 · ×0 — 10\n\n"
+        "👇 Выбери один билет:"
+    )
+
+
+@serialized_game
+async def start_lottery_game(message: Message) -> None:
+    user_id = message.from_user.id
+    if await db.is_banned(user_id):
+        await message.reply(BAN_MESSAGE)
+        return
+    if user_id in active_games:
+        await message.reply("🎰 У тебя уже есть активная игра! Сначала заверши её.")
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Использование: лотерея ставка\nПример: лотерея 1000")
+        return
+    try:
+        bet = int(args[1])
+    except ValueError:
+        await message.reply("❌ Ставка должна быть числом.")
+        return
+    if bet < CASINO_MIN_BET:
+        await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
+        return
+    if user_id in casino_bet_cooldowns:
+        await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
+        return
+    if not await db.remove_coins(user_id, bet):
+        balance, _ = await db.get_coins(user_id)
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        return
+    casino_bet_cooldowns[user_id] = True
+    board = list(LOTTERY_MULTIPLIERS)
+    random.shuffle(board)
+    game = {
+        "game": "lottery",
+        "token": secrets.token_hex(12),
+        "bet": bet,
+        "board": board,
+        "chat_id": message.chat.id,
+        "expires": time.time() + CASINO_TIMEOUT,
+    }
+    active_games[user_id] = game
+    sent = await message.reply(lottery_text(game), reply_markup=lottery_keyboard(game))
+    game["message_id"] = sent.message_id
+
+
+@router.message(Command("lottery"))
+async def cmd_lottery(message: Message, bot: Bot) -> None:
+    if message.chat.type != "private":
+        return
+    await start_lottery_game(message)
+
+
+@router.callback_query(F.data.startswith("lottery_cell_"))
+@serialized_game
+async def lottery_open_ticket(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    game = active_games.get(user_id)
+    if not game or game.get("game") != "lottery":
+        await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+    if callback.message.message_id != game.get("message_id") or callback.message.chat.id != game["chat_id"]:
+        await callback.answer("Это поле от другой игры.", show_alert=True)
+        return
+    try:
+        cell = int(callback.data.removeprefix("lottery_cell_"))
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректный билет.", show_alert=True)
+        return
+    if cell < 0 or cell >= 25:
+        await callback.answer("Некорректный билет.", show_alert=True)
+        return
+    active_games.pop(user_id, None)
+    multiplier = float(game["board"][cell])
+    prize = int(game["bet"] * multiplier)
+    if prize:
+        await db.add_coins(user_id, prize)
+    if multiplier >= 1:
+        boss_note = await school_game(
+            callback.from_user, f"lottery:{game['token']}", game["bet"], True
+        )
+    else:
+        net_loss = game["bet"] - prize
+        damage, refund = await school_event.record(
+            user_id,
+            display_name(callback.from_user),
+            f"lottery:{game['token']}",
+            {"games": 1, "gamewin": 0, "bets": game["bet"]},
+            loss=net_loss,
+        )
+        boss_note = (
+            f"\n📚 Урон боссу: {damage:,}. Возвращено: {refund:,} DC".replace(",", " ")
+            if damage else ""
+        )
+    balance = await db.get_display_balance(user_id)
+    if multiplier > 1:
+        headline = "🎉 Победа!"
+    elif multiplier == 1:
+        headline = "↩️ Ставка вернулась."
+    elif multiplier > 0:
+        headline = "😕 Вернулась только часть ставки."
+    else:
+        headline = "❌ Билет оказался пустым."
+    bet_text = f"{game['bet']:,}".replace(",", " ")
+    prize_text = f"{prize:,}".replace(",", " ")
+    balance_text = f"{balance:,}".replace(",", " ")
+    result = (
+        "🎫 Лотерея завершена!\n\n"
+        f"{headline}\n"
+        f"🎯 Коэффициент: {lottery_multiplier_text(multiplier)}\n"
+        f"💸 Ставка: {bet_text} DC\n"
+        f"💰 Выплата: {prize_text} DC\n"
+        f"🪙 Баланс: {balance_text} DC{boss_note}"
+    )
+    await callback.message.edit_text(
+        result, reply_markup=lottery_keyboard(game, reveal=True, selected=cell)
+    )
+    await send_game_log(
+        bot,
+        (
+            "🎫 Лотерея 5×5\n"
+            f"👤 {display_name(callback.from_user)} ({user_id})\n"
+            f"💸 Ставка: {bet_text} DC\n"
+            f"🎯 Коэффициент: {lottery_multiplier_text(multiplier)}\n"
+            f"💰 Выплата: {prize_text} DC\n🪙 Баланс: {balance_text} DC"
+        ),
+    )
+    await callback.answer(f"🎯 {lottery_multiplier_text(multiplier)}")
+
+
+@router.callback_query(F.data == "lottery_done")
+async def lottery_done(callback: CallbackQuery) -> None:
     await callback.answer("Игра уже завершена.")
 
 
@@ -5298,14 +5995,14 @@ PRIVATE_PLAIN_COMMANDS = {
     "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
-    "promo", "cases", "slots", "roulette", "dice", "mines", "scratch", "admin", "broadcast",
+    "promo", "cases", "slots", "roulette", "dice", "mines", "scratch", "coinflip", "lottery", "admin", "bossdamage", "broadcast",
     "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "say", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
-    "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "scratch", "admin",
+    "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "scratch", "coinflip", "lottery", "admin",
     "supportgrant", "supportrevoke", "supportreply", "supportclose",
 }
 PLAIN_COMMAND_HANDLERS = {
@@ -5327,7 +6024,10 @@ PLAIN_COMMAND_HANDLERS = {
     "promo": cmd_promo, "transfer": cmd_transfer, "daytop": cmd_daytop,
     "bonus": cmd_bonus, "cases": cmd_cases, "slots": cmd_slots,
     "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines, "scratch": cmd_scratch,
+    "coinflip": cmd_coinflip,
+    "lottery": cmd_lottery,
     "duel": cmd_duel, "exchange": cmd_exchange, "admin": cmd_admin,
+    "bossdamage": cmd_bossdamage,
     "broadcast": cmd_broadcast,
     "supportgrant": cmd_supportgrant, "supportrevoke": cmd_supportrevoke,
     "supportlist": cmd_supportlist, "supportreply": cmd_supportreply,
@@ -5438,19 +6138,32 @@ async def support_user_message_handler(message: Message, bot: Bot) -> None:
 async def group_handler(message: Message, bot: Bot) -> None:
     if message.chat.id != MAIN_CHAT_ID:
         if message.chat.id == CHANNEL_CHAT_ID:
-            # В чате канала разрешены дуэли, но обычные сообщения не участвуют
-            # в розыгрыше основной группы. Username сохраняем для адресных вызовов.
+            # В чате канала обычные сообщения засчитываются в квесты, но не
+            # участвуют в розыгрыше подарков и не начисляют монеты за общение.
+            msg_text = message.text or message.caption
             if (
-                message.from_user
+                msg_text
+                and not msg_text.startswith("/")
+                and message.from_user
                 and not message.from_user.is_bot
                 and not message.sender_chat
-                and message.from_user.username
             ):
-                await db.set_username(
-                    message.from_user.id,
-                    message.from_user.username,
-                    message.chat.id,
-                    display_name(message.from_user),
+                user_id = message.from_user.id
+                name = display_name(message.from_user)
+                if await db.is_banned(user_id):
+                    return
+                if message.from_user.username:
+                    await db.set_username(
+                        user_id,
+                        message.from_user.username,
+                        message.chat.id,
+                        name,
+                    )
+                await school_event.record(
+                    user_id,
+                    name,
+                    f"message:{message.chat.id}:{message.message_id}",
+                    {"messages": 1},
                 )
             return
         if not CHANNEL_CHAT_ID:
