@@ -63,6 +63,10 @@ CASINO_MIN_BET     = 5
 CASINO_TIMEOUT     = 300  # 5 минут
 CASINO_BET_COOLDOWN = 10  # секунд между ставками одного пользователя
 CASE_OPEN_COOLDOWN = 5    # секунд между открытиями кейса
+GAME_BET_PRESETS = (100, 500, 1000, 2500, 5000, 10000, 50000, 100000)
+SCRATCH_SYMBOLS = ("🌈", "🔥", "🍓", "🍒", "🍋", "💎")
+SCRATCH_WIN_CHANCE = 0.30
+SCRATCH_MULTIPLIER = 3
 
 # Дуэли в основном чате
 DUEL_MIN_BET       = 5
@@ -2050,7 +2054,7 @@ PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
-    "roulette", "dice", "mines", "duel", "exchange", "admin", "broadcast",
+    "roulette", "dice", "mines", "scratch", "duel", "exchange", "admin", "broadcast",
     "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 
@@ -2062,6 +2066,7 @@ RUSSIAN_COMMANDS = {
     "топкоинов": "cointop", "дневнойтоп": "daytop",
     "промо": "promo", "перевод": "transfer", "слоты": "slots",
     "рулетка": "roulette", "кубик": "dice", "мины": "mines",
+    "скретч": "scratch", "скретчкарты": "scratch", "скретч-карты": "scratch",
     "удалитьзаявку": "deletepending",
     "добавитьвизуал": "addvisual", "убратьвизуал": "removevisual",
     "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
@@ -2091,6 +2096,7 @@ def start_keyboard(is_admin: bool = False, support_access: bool = False):
     buttons = [
         [InlineKeyboardButton(text="🏫 Школьный ивент", callback_data="school:boss")],
         [InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"), InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0")],
+        [InlineKeyboardButton(text="🎮 Игры", callback_data="games")],
         [InlineKeyboardButton(text="📦 Кейсы", callback_data="cases")],
         [InlineKeyboardButton(text="⭐ Купить D-COINS", callback_data="buy_dc_menu")],
         [InlineKeyboardButton(text="❓ Как играть", callback_data="help")],
@@ -2357,10 +2363,12 @@ async def send_help(message: Message) -> None:
         "2️⃣ Пиши сообщения в основной группе — за них начисляются DC.\n"
         "3️⃣ Забирай ежедневный бонус в личке или основной группе: бонус.\n\n"
         "🎰 Игры — только в личке с ботом\n"
+        "Нажми «🎮 Игры» в главном меню и выбери игру и ставку кнопками.\n"
         "• слоты 50\n"
         "• рулетка красное 50\n"
         "• кубик 3 50\n"
         "• мины 2500\n"
+        "• скретч 1000\n"
         "В минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n"
         "⚔️ Дуэли — в основном чате и привязанном чате канала\n"
         "• дуэль 1000 — создать вызов на 1 000 DC\n"
@@ -4019,6 +4027,154 @@ async def open_student_case(callback: CallbackQuery, bot: Bot) -> None:
 async def open_excellent_case(callback: CallbackQuery, bot: Bot) -> None:
     await open_case(callback, bot, "excellent")
 
+
+# =========================
+# PRIVATE — INLINE GAME MENU
+# =========================
+
+def games_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎰 Слоты", callback_data="game:slots"),
+            InlineKeyboardButton(text="🎡 Рулетка", callback_data="game:roulette"),
+        ],
+        [
+            InlineKeyboardButton(text="🎲 Кубик", callback_data="game:dice"),
+            InlineKeyboardButton(text="💣 Мины", callback_data="game:mines"),
+        ],
+        [InlineKeyboardButton(text="🎟 Скретч-карты", callback_data="game:scratch")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+
+
+def game_bet_keyboard(game: str, option: str = "-") -> InlineKeyboardMarkup:
+    buttons = []
+    for index in range(0, len(GAME_BET_PRESETS), 2):
+        row = []
+        for bet in GAME_BET_PRESETS[index:index + 2]:
+            row.append(InlineKeyboardButton(
+                text=f"{bet:,} DC".replace(",", " "),
+                callback_data=f"gb:{game}:{option}:{bet}",
+            ))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "games")
+async def games_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "🎮 Игры\n\nВыбери игру. Ставки списываются только с реального баланса.",
+        reply_markup=games_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "main_menu")
+async def main_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not await is_channel_subscriber(bot, callback.from_user.id):
+        await callback.message.edit_text(
+            "📢 Чтобы пользоваться ботом, подпишись на наш канал.",
+            reply_markup=subscription_keyboard(),
+        )
+        await callback.answer("Нужна подписка", show_alert=True)
+        return
+    support_access = await db.has_support_access(callback.from_user.id)
+    await callback.message.edit_text(
+        "👋 Добро пожаловать!\n\nВыберите действие:",
+        reply_markup=start_keyboard(callback.from_user.id == ADMIN_ID, support_access),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("game:"))
+async def game_options_menu(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    game = parts[1] if len(parts) > 1 else ""
+    option = parts[2] if len(parts) > 2 else None
+    titles = {
+        "slots": "🎰 Слоты — выбери ставку",
+        "mines": "💣 Мины — выбери ставку",
+        "scratch": "🎟 Скретч-карты — выбери ставку",
+    }
+    if game in titles:
+        await callback.message.edit_text(titles[game], reply_markup=game_bet_keyboard(game))
+    elif game == "roulette" and option in {"red", "black"}:
+        color = "🔴 красное" if option == "red" else "⚫ чёрное"
+        await callback.message.edit_text(
+            f"🎡 Рулетка\nВыбрано: {color}\n\nВыбери ставку:",
+            reply_markup=game_bet_keyboard(game, option),
+        )
+    elif game == "roulette":
+        await callback.message.edit_text(
+            "🎡 Рулетка\n\nВыбери цвет:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔴 Красное", callback_data="game:roulette:red"),
+                 InlineKeyboardButton(text="⚫ Чёрное", callback_data="game:roulette:black")],
+                [InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")],
+            ]),
+        )
+    elif game == "dice" and option in {"1", "2", "3", "4", "5", "6"}:
+        await callback.message.edit_text(
+            f"🎲 Кубик\nВыбрано число: {option}\n\nВыбери ставку:",
+            reply_markup=game_bet_keyboard(game, option),
+        )
+    elif game == "dice":
+        await callback.message.edit_text(
+            "🎲 Кубик\n\nКакое число выпадет?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=str(number), callback_data=f"game:dice:{number}") for number in range(1, 4)],
+                [InlineKeyboardButton(text=str(number), callback_data=f"game:dice:{number}") for number in range(4, 7)],
+                [InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")],
+            ]),
+        )
+    else:
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("gb:"))
+async def inline_game_bet(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, game, option, raw_bet = callback.data.split(":", 3)
+        bet = int(raw_bet)
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная ставка.", show_alert=True)
+        return
+    if bet not in GAME_BET_PRESETS:
+        await callback.answer("Этой ставки нет в меню.", show_alert=True)
+        return
+    if game == "roulette" and option not in {"red", "black"}:
+        await callback.answer("Сначала выбери цвет.", show_alert=True)
+        return
+    if game == "dice" and option not in {"1", "2", "3", "4", "5", "6"}:
+        await callback.answer("Сначала выбери число.", show_alert=True)
+        return
+    commands = {
+        "slots": f"/slots {bet}",
+        "mines": f"/mines {bet}",
+        "scratch": f"/scratch {bet}",
+        "roulette": f"/roulette {option} {bet}",
+        "dice": f"/dice {option} {bet}",
+    }
+    command = commands.get(game)
+    if command is None:
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+    await callback.answer("🎮 Запускаю игру")
+    message = callback.message.model_copy(update={"from_user": callback.from_user, "text": command})
+    if game == "mines":
+        await cmd_mines(message)
+    elif game == "scratch":
+        await cmd_scratch(message, bot)
+    elif game == "slots":
+        await cmd_slots(message, bot)
+    elif game == "roulette":
+        await cmd_roulette(message, bot)
+    else:
+        await cmd_dice(message, bot)
+
 # =========================
 # GROUP — CASINO
 # =========================
@@ -4451,6 +4607,190 @@ async def mines_cashout(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "mines_done")
 async def mines_done(callback: CallbackQuery) -> None:
+    await callback.answer("Игра уже завершена.")
+
+
+# =========================
+# PRIVATE — SCRATCH CARDS
+# =========================
+
+def create_scratch_board(win: bool) -> list[str]:
+    """Создаёт поле с одной тройкой при победе и без троек при проигрыше."""
+    if win:
+        target = random.choice(SCRATCH_SYMBOLS)
+        fillers = random.sample([symbol for symbol in SCRATCH_SYMBOLS if symbol != target], 3)
+        board = [target] * 3 + [symbol for symbol in fillers for _ in range(2)]
+    else:
+        fillers = random.sample(list(SCRATCH_SYMBOLS), 5)
+        board = [symbol for symbol in fillers[:4] for _ in range(2)] + [fillers[4]]
+    random.shuffle(board)
+    return board
+
+
+def scratch_keyboard(game: dict, reveal: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    for row in range(3):
+        line = []
+        for column in range(3):
+            cell = row * 3 + column
+            opened = reveal or cell in game["opened"]
+            line.append(InlineKeyboardButton(
+                text=game["board"][cell] if opened else "❓",
+                callback_data="scratch_done" if reveal else f"scratch_cell_{cell}",
+            ))
+        buttons.append(line)
+    if reveal:
+        buttons.append([InlineKeyboardButton(text="🔄 Играть ещё", callback_data="game:scratch")])
+        buttons.append([InlineKeyboardButton(text="🎮 Все игры", callback_data="games")])
+    else:
+        buttons.append([InlineKeyboardButton(text="✨ Открыть всё", callback_data="scratch_reveal")])
+        buttons.append([InlineKeyboardButton(text="🎮 Все игры", callback_data="games")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def scratch_text(game: dict) -> str:
+    return (
+        "🎟 Скретч-карты\n\n"
+        "🎯 Задача: найти 3 одинаковых символа.\n"
+        "❌ Если тройки нет — проигрыш.\n"
+        f"💸 Выигрыш: ×{SCRATCH_MULTIPLIER}\n\n"
+        f"💰 Ставка: {game['bet']:,} DC\n"
+        f"🪙 Баланс: {game['balance']:,} DC\n\n"
+        "👇 Открывай клетки или нажми «Открыть всё»."
+    ).replace(",", " ")
+
+
+@serialized_game
+async def start_scratch_game(message: Message) -> None:
+    user_id = message.from_user.id
+    if await db.is_banned(user_id):
+        await message.reply(BAN_MESSAGE)
+        return
+    if user_id in active_games:
+        await message.reply("🎰 У тебя уже есть активная игра! Сначала заверши её.")
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Использование: скретч ставка\nПример: скретч 1000")
+        return
+    try:
+        bet = int(args[1])
+    except ValueError:
+        await message.reply("❌ Ставка должна быть числом.")
+        return
+    if bet < CASINO_MIN_BET:
+        await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
+        return
+    if user_id in casino_bet_cooldowns:
+        await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
+        return
+    if not await db.remove_coins(user_id, bet):
+        balance, _ = await db.get_coins(user_id)
+        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        return
+    casino_bet_cooldowns[user_id] = True
+    win = random.random() < SCRATCH_WIN_CHANCE
+    game = {
+        "game": "scratch",
+        "token": secrets.token_hex(12),
+        "bet": bet,
+        "board": create_scratch_board(win),
+        "opened": set(),
+        "win": win,
+        "balance": await db.get_display_balance(user_id),
+        "chat_id": message.chat.id,
+        "expires": time.time() + CASINO_TIMEOUT,
+    }
+    active_games[user_id] = game
+    sent = await message.reply(scratch_text(game), reply_markup=scratch_keyboard(game))
+    game["message_id"] = sent.message_id
+
+
+@router.message(Command("scratch"))
+async def cmd_scratch(message: Message, bot: Bot) -> None:
+    if message.chat.type != "private":
+        return
+    await start_scratch_game(message)
+
+
+async def finish_scratch_game(callback: CallbackQuery, bot: Bot, game: dict) -> None:
+    user_id = callback.from_user.id
+    active_games.pop(user_id, None)
+    game["opened"] = set(range(9))
+    if game["win"]:
+        prize = game["bet"] * SCRATCH_MULTIPLIER
+        await db.add_coins(user_id, prize)
+        await school_game(callback.from_user, f"scratch:{game['token']}", game["bet"], True)
+        balance = await db.get_display_balance(user_id)
+        result = (
+            "🎟 Скретч-карты\n\n"
+            "🎉 ПОБЕДА! Найдены 3 одинаковых символа.\n"
+            f"💰 Выигрыш: {prize:,} DC (×{SCRATCH_MULTIPLIER})\n"
+            f"🪙 Баланс: {balance:,} DC"
+        ).replace(",", " ")
+        log_result = f"✅ Выигрыш: {prize} DC"
+    else:
+        boss_note = await school_game(callback.from_user, f"scratch:{game['token']}", game["bet"], False)
+        balance = await db.get_display_balance(user_id)
+        result = (
+            "🎟 Скретч-карты\n\n"
+            "❌ Трёх одинаковых символов нет. Ты проиграл.\n"
+            f"💸 Ставка: {game['bet']:,} DC\n"
+            f"🪙 Баланс: {balance:,} DC{boss_note}"
+        ).replace(",", " ")
+        log_result = "❌ Проигрыш"
+    await callback.message.edit_text(result, reply_markup=scratch_keyboard(game, reveal=True))
+    await send_game_log(
+        bot,
+        f"🎟 Скретч-карты\n👤 {display_name(callback.from_user)} ({user_id})\n"
+        f"💸 Ставка: {game['bet']} DC\n{log_result}\n🪙 Баланс: {balance} DC",
+    )
+
+
+@router.callback_query(F.data.startswith("scratch_cell_"))
+@serialized_game
+async def scratch_open_cell(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    game = active_games.get(user_id)
+    if not game or game.get("game") != "scratch":
+        await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+    if callback.message.message_id != game.get("message_id") or callback.message.chat.id != game["chat_id"]:
+        await callback.answer("Это поле от другой игры.", show_alert=True)
+        return
+    try:
+        cell = int(callback.data.removeprefix("scratch_cell_"))
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная клетка.", show_alert=True)
+        return
+    if cell < 0 or cell >= 9 or cell in game["opened"]:
+        await callback.answer("Эта клетка уже открыта.")
+        return
+    game["opened"].add(cell)
+    if len(game["opened"]) == 9:
+        await finish_scratch_game(callback, bot, game)
+    else:
+        await callback.message.edit_text(scratch_text(game), reply_markup=scratch_keyboard(game))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "scratch_reveal")
+@serialized_game
+async def scratch_reveal(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    game = active_games.get(user_id)
+    if not game or game.get("game") != "scratch":
+        await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+    if callback.message.message_id != game.get("message_id") or callback.message.chat.id != game["chat_id"]:
+        await callback.answer("Это поле от другой игры.", show_alert=True)
+        return
+    await finish_scratch_game(callback, bot, game)
+    await callback.answer("🎟 Карта открыта")
+
+
+@router.callback_query(F.data == "scratch_done")
+async def scratch_done(callback: CallbackQuery) -> None:
     await callback.answer("Игра уже завершена.")
 
 
@@ -4958,14 +5298,14 @@ PRIVATE_PLAIN_COMMANDS = {
     "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
-    "promo", "cases", "slots", "roulette", "dice", "mines", "admin", "broadcast",
+    "promo", "cases", "slots", "roulette", "dice", "mines", "scratch", "admin", "broadcast",
     "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop"}
 BOT_ARGUMENT_COMMANDS = {
     "start", "say", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
-    "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "admin",
+    "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "scratch", "admin",
     "supportgrant", "supportrevoke", "supportreply", "supportclose",
 }
 PLAIN_COMMAND_HANDLERS = {
@@ -4986,7 +5326,7 @@ PLAIN_COMMAND_HANDLERS = {
     "cointop": cmd_cointop, "coins": cmd_coins,
     "promo": cmd_promo, "transfer": cmd_transfer, "daytop": cmd_daytop,
     "bonus": cmd_bonus, "cases": cmd_cases, "slots": cmd_slots,
-    "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines,
+    "roulette": cmd_roulette, "dice": cmd_dice, "mines": cmd_mines, "scratch": cmd_scratch,
     "duel": cmd_duel, "exchange": cmd_exchange, "admin": cmd_admin,
     "broadcast": cmd_broadcast,
     "supportgrant": cmd_supportgrant, "supportrevoke": cmd_supportrevoke,
