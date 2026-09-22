@@ -396,9 +396,16 @@ class Database:
                     message_id       INTEGER,
                     winner_id        INTEGER,
                     winner_name      TEXT,
+                    announced_at     REAL,
                     created_at       REAL NOT NULL
                 )
             """)
+            # Колонка добавляется и в уже работающую базу: результат розыгрыша
+            # будет публиковаться повторно, пока канал не подтвердит отправку.
+            async with db.execute("PRAGMA table_info(mini_events)") as cur:
+                mini_event_columns = {row[1] for row in await cur.fetchall()}
+            if "announced_at" not in mini_event_columns:
+                await db.execute("ALTER TABLE mini_events ADD COLUMN announced_at REAL")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS mini_event_players (
                     event_id INTEGER NOT NULL,
@@ -1506,6 +1513,28 @@ class Database:
             except Exception:
                 await db.rollback()
                 raise
+
+    async def pending_mini_event_announcements(self) -> list[dict]:
+        """Completed ticket draws that still need a public winner announcement."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT event.*, COUNT(player.user_id) AS participant_count "
+                "FROM mini_events AS event "
+                "LEFT JOIN mini_event_players AS player ON player.event_id=event.id "
+                "WHERE event.kind='ticket' AND event.status='completed' "
+                "AND event.winner_id IS NOT NULL AND event.announced_at IS NULL "
+                "GROUP BY event.id ORDER BY event.id"
+            ) as cur:
+                return [dict(row) for row in await cur.fetchall()]
+
+    async def mark_mini_event_announced(self, event_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE mini_events SET announced_at=? WHERE id=? AND announced_at IS NULL",
+                (time.time(), event_id),
+            )
+            await db.commit()
 
     async def open_case(self, user_id: int, case_id: str, price: int | None, key_only: bool = False) -> str:
         async with aiosqlite.connect(self.path) as db:
@@ -2633,30 +2662,34 @@ async def mini_event_task(bot: Bot) -> None:
             outcomes = await db.finish_due_mini_events()
             for outcome in outcomes:
                 event = outcome["event"]
-                if outcome["kind"] == "ticket_winner":
-                    text = (
-                        "🎟 Счастливый билет разыгран!\n\n"
-                        f"🏆 Победитель: {outcome['winner_name']}\n"
-                        f"💰 Награда: {event['reward']:,} DC\n"
-                        f"👥 Участников: {outcome['count']}"
-                    ).replace(",", " ")
-                    try:
-                        await bot.send_message(event["chat_id"], text)
-                    except Exception as error:
-                        logger.warning("Could not publish mini event result: %s", error)
-                    try:
-                        await bot.send_message(
-                            outcome["winner_id"],
-                            f"🏆 Ты выиграл в событии «Счастливый билет»!\n"
-                            f"💰 Зачислено: {event['reward']:,} DC".replace(",", " "),
-                        )
-                    except Exception:
-                        pass
-                elif event["kind"] == "ticket":
+                if outcome["kind"] == "expired" and event["kind"] == "ticket":
                     try:
                         await bot.send_message(event["chat_id"], "⌛ Счастливый билет завершён: участников не было.")
                     except Exception:
                         pass
+            # Если Telegram временно не принял пост, запись остаётся неотмеченной
+            # и задача повторит отправку на следующем цикле — победитель не пропадёт.
+            for event in await db.pending_mini_event_announcements():
+                text = (
+                    "🎟 Счастливый билет разыгран!\n\n"
+                    f"🏆 Победитель: {event['winner_name']}\n"
+                    f"💰 Награда: {event['reward']:,} DC\n"
+                    f"👥 Участников: {event['participant_count']}"
+                ).replace(",", " ")
+                try:
+                    await bot.send_message(event["chat_id"], text)
+                except Exception as error:
+                    logger.warning("Could not publish mini event result: %s", error)
+                    continue
+                await db.mark_mini_event_announced(event["id"])
+                try:
+                    await bot.send_message(
+                        event["winner_id"],
+                        f"🏆 Ты выиграл в событии «Счастливый билет»!\n"
+                        f"💰 Зачислено: {event['reward']:,} DC".replace(",", " "),
+                    )
+                except Exception:
+                    pass
         except Exception:
             logger.exception("Mini event task failed")
         await asyncio.sleep(5)
