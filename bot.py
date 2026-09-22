@@ -1590,6 +1590,25 @@ class SchoolEvent:
         async with self.transaction() as c:
             await c.execute("UPDATE school_seasons SET stopped=1 WHERE id=?", (season,))
 
+    async def change_event_days(self, days: int, admin_id: int, token: str):
+        if not isinstance(days, int) or days == 0 or abs(days) > 365:
+            raise ValueError("Days must be a nonzero integer within -365..365")
+        async with self.transaction() as c:
+            season = await self.current(c, active=False)
+            if not season:
+                return "missing", None
+            if season["stopped"]:
+                return "stopped", None
+            action = await c.execute(
+                "INSERT OR IGNORE INTO school_actions(season,uid,token) VALUES (?,?,?)",
+                (season["id"], admin_id, token),
+            )
+            if action.rowcount != 1:
+                return "duplicate", season["ends"]
+            new_end = season["ends"] + days * 86400
+            await c.execute("UPDATE school_seasons SET ends=? WHERE id=?", (new_end, season["id"]))
+            return "updated", new_end
+
     async def coins(self, c, uid, amount):
         await c.execute("INSERT INTO coins(user_id,balance) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET balance=balance+?", (uid, COINS_START + amount, amount))
 
@@ -2171,7 +2190,7 @@ PLAIN_COMMANDS = {
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
     "stats", "top", "winstop", "cointop",
     "coins", "promo", "transfer", "daytop", "bonus", "cases", "slots",
-    "roulette", "dice", "mines", "scratch", "coinflip", "lottery", "duel", "exchange", "admin", "bossdamage", "broadcast",
+    "roulette", "dice", "mines", "scratch", "coinflip", "lottery", "duel", "exchange", "admin", "bossdamage", "eventdays", "broadcast",
     "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 
@@ -2190,6 +2209,7 @@ RUSSIAN_COMMANDS = {
     "добавитьвизуал": "addvisual", "убратьвизуал": "removevisual",
     "админ": "admin", "админка": "admin", "дуэль": "duel", "дуель": "duel",
     "уронбоссу": "bossdamage", "ударитьбосса": "bossdamage",
+    "дниивента": "eventdays",
     "раздать": "broadcast",
     "датьдоступ": "supportgrant", "убратьдоступ": "supportrevoke",
     "доступы": "supportlist", "ответ": "supportreply", "закрытьчат": "supportclose",
@@ -3300,6 +3320,47 @@ async def cmd_admin(message: Message, bot: Bot) -> None:
     await message.answer(await admin_dashboard_text(bot), reply_markup=admin_panel_keyboard())
 
 
+@router.message(Command("eventdays"), F.chat.type == "private")
+async def cmd_eventdays(message: Message) -> None:
+    if message.chat.type != "private" or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    try:
+        days = int(parts[1]) if len(parts) == 2 else 0
+    except ValueError:
+        days = 0
+    if days == 0 or abs(days) > 365:
+        await message.answer(
+            "Использование: дниивента +3 — продлить на 3 дня\n"
+            "дниивента -2 — сократить на 2 дня\n"
+            "Укажи целое число от -365 до 365, кроме нуля."
+        )
+        return
+    status, new_end = await school_event.change_event_days(
+        days, message.from_user.id,
+        f"eventdays:{message.chat.id}:{message.message_id}",
+    )
+    if status != "updated":
+        notices = {
+            "missing": "❌ Ивент ещё не создан.",
+            "stopped": "❌ Ивент остановлен вручную. Изменение срока его не запускает.",
+            "duplicate": "ℹ️ Эта команда уже применена.",
+        }
+        await message.answer(notices[status])
+        return
+    deadline = datetime.fromtimestamp(new_end, pytz.timezone("Asia/Tashkent")).strftime("%d.%m.%Y %H:%M")
+    remaining = new_end - time.time()
+    if remaining > 0:
+        minutes = int(remaining // 60)
+        duration = f"⏳ Осталось: {minutes // 1440} д. {minutes % 1440 // 60} ч. {minutes % 60} мин."
+    else:
+        duration = "⌛ Новый срок уже наступил — ивент завершён."
+    await message.answer(
+        f"✅ Срок ивента изменён на {days:+d} дн.\n"
+        f"📅 Завершение: {deadline} (Ташкент)\n{duration}"
+    )
+
+
 @router.message(Command("bossdamage"), F.chat.type == "private")
 async def cmd_bossdamage(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
@@ -3852,6 +3913,7 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
         "раздать СУММА — начислить DC всем пользователям бота\n"
         "раздать кейс НАЗВАНИЕ [КОЛ-ВО] — выдать всем ключи\n"
         "уронбоссу СУММА — вручную уменьшить HP босса\n"
+        "дниивента +3 / дниивента -2 — изменить срок ивента\n"
         "popolnit — пополнить баланс звёзд бота",
         reply_markup=admin_back_keyboard(),
     )
@@ -5995,7 +6057,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
     "pending", "deliver", "deletepending", "premiumorders", "premiumdone", "premiumrefund",
-    "promo", "cases", "slots", "roulette", "dice", "mines", "scratch", "coinflip", "lottery", "admin", "bossdamage", "broadcast",
+    "promo", "cases", "slots", "roulette", "dice", "mines", "scratch", "coinflip", "lottery", "admin", "bossdamage", "eventdays", "broadcast",
     "supportgrant", "supportrevoke", "supportlist", "supportreply", "supportclose",
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop"}
@@ -6028,6 +6090,7 @@ PLAIN_COMMAND_HANDLERS = {
     "lottery": cmd_lottery,
     "duel": cmd_duel, "exchange": cmd_exchange, "admin": cmd_admin,
     "bossdamage": cmd_bossdamage,
+    "eventdays": cmd_eventdays,
     "broadcast": cmd_broadcast,
     "supportgrant": cmd_supportgrant, "supportrevoke": cmd_supportrevoke,
     "supportlist": cmd_supportlist, "supportreply": cmd_supportreply,
