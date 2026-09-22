@@ -64,6 +64,9 @@ CASINO_TIMEOUT     = 300  # 5 минут
 CASINO_BET_COOLDOWN = 10  # секунд между ставками одного пользователя
 CASE_OPEN_COOLDOWN = 5    # секунд между открытиями кейса
 GAME_BET_PRESETS = (100, 500, 1000, 2500, 5000, 10000, 50000, 100000)
+JACKPOT_PERCENT = 2
+JACKPOT_TICKET_STEP = 5_000
+JACKPOT_TICKET_LIMIT = 20
 SCRATCH_SYMBOLS = ("🌈", "🔥", "🍓", "🍒", "🍋", "💎")
 SCRATCH_WIN_CHANCE = 0.30
 SCRATCH_MULTIPLIER = 3
@@ -81,6 +84,10 @@ PANDORA_REWARDS = (
     ("gift", 15, 0.60), ("gift", 25, 0.25), ("gift", 50, 0.10),
     ("gift", 100, 0.04), ("premium", 1, 0.01),
 )
+
+def jackpot_day_key(now: float | None = None) -> str:
+    stamp = time.time() if now is None else now
+    return datetime.fromtimestamp(stamp, pytz.timezone("Europe/Moscow")).date().isoformat()
 
 # Дуэли в основном чате
 DUEL_MIN_BET       = 5
@@ -347,6 +354,58 @@ class Database:
                 CREATE TABLE IF NOT EXISTS pandora_claims (
                     user_id     INTEGER PRIMARY KEY,
                     last_opened REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS jackpot_days (
+                    day         TEXT PRIMARY KEY,
+                    pool        INTEGER NOT NULL DEFAULT 0,
+                    drawn       INTEGER NOT NULL DEFAULT 0,
+                    winner_id   INTEGER,
+                    winner_name TEXT,
+                    drawn_at    REAL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS jackpot_players (
+                    day     TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    name    TEXT NOT NULL,
+                    loss    INTEGER NOT NULL DEFAULT 0,
+                    tickets INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(day, user_id)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS jackpot_actions (
+                    day     TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    token   TEXT NOT NULL,
+                    PRIMARY KEY(day, user_id, token)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS mini_events (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind             TEXT NOT NULL,
+                    chat_id          TEXT NOT NULL,
+                    reward           INTEGER NOT NULL,
+                    max_participants INTEGER NOT NULL DEFAULT 0,
+                    ends             REAL NOT NULL,
+                    status           TEXT NOT NULL DEFAULT 'active',
+                    message_id       INTEGER,
+                    winner_id        INTEGER,
+                    winner_name      TEXT,
+                    created_at       REAL NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS mini_event_players (
+                    event_id INTEGER NOT NULL,
+                    user_id  INTEGER NOT NULL,
+                    name     TEXT NOT NULL,
+                    joined_at REAL NOT NULL,
+                    PRIMARY KEY(event_id, user_id)
                 )
             """)
             await db.execute("""
@@ -1161,6 +1220,289 @@ class Database:
                     )
                 await db.commit()
                 return broadcast_id, len(users)
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def record_jackpot_loss(
+        self, user_id: int, user_name: str, loss: int, token: str, now: float | None = None
+    ) -> tuple[int, int, int]:
+        """Adds 2% of a real loss to today's jackpot and awards capped tickets."""
+        if loss <= 0:
+            return 0, 0, 0
+        now = time.time() if now is None else now
+        day = jackpot_day_key(now)
+        contribution = int(loss) * JACKPOT_PERCENT // 100
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute("INSERT OR IGNORE INTO jackpot_days(day) VALUES (?)", (day,))
+                action = await db.execute(
+                    "INSERT OR IGNORE INTO jackpot_actions(day,user_id,token) VALUES (?,?,?)",
+                    (day, user_id, token),
+                )
+                if action.rowcount != 1:
+                    await db.rollback()
+                    return 0, 0, 0
+                async with db.execute(
+                    "SELECT loss,tickets FROM jackpot_players WHERE day=? AND user_id=?", (day, user_id)
+                ) as cur:
+                    previous = await cur.fetchone()
+                old_loss, old_tickets = previous if previous else (0, 0)
+                total_loss = int(old_loss) + int(loss)
+                tickets = min(JACKPOT_TICKET_LIMIT, total_loss // JACKPOT_TICKET_STEP)
+                earned = tickets - int(old_tickets)
+                await db.execute(
+                    "INSERT INTO jackpot_players(day,user_id,name,loss,tickets) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(day,user_id) DO UPDATE SET "
+                    "name=excluded.name,loss=excluded.loss,tickets=excluded.tickets",
+                    (day, user_id, user_name, total_loss, tickets),
+                )
+                if contribution:
+                    await db.execute("UPDATE jackpot_days SET pool=pool+? WHERE day=?", (contribution, day))
+                await db.commit()
+                return contribution, earned, tickets
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def jackpot_summary(self, user_id: int, now: float | None = None) -> dict:
+        day = jackpot_day_key(now)
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute("SELECT pool FROM jackpot_days WHERE day=?", (day,)) as cur:
+                pool_row = await cur.fetchone()
+            async with db.execute(
+                "SELECT tickets,loss FROM jackpot_players WHERE day=? AND user_id=?", (day, user_id)
+            ) as cur:
+                player_row = await cur.fetchone()
+            async with db.execute(
+                "SELECT COUNT(*) FROM jackpot_players WHERE day=? AND tickets>0", (day,)
+            ) as cur:
+                players_row = await cur.fetchone()
+        return {
+            "day": day,
+            "pool": int(pool_row[0]) if pool_row else 0,
+            "tickets": int(player_row[0]) if player_row else 0,
+            "loss": int(player_row[1]) if player_row else 0,
+            "players": int(players_row[0]) if players_row else 0,
+        }
+
+    async def jackpot_top(self, now: float | None = None, limit: int = 10) -> list:
+        day = jackpot_day_key(now)
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT name,tickets FROM jackpot_players WHERE day=? AND tickets>0 "
+                "ORDER BY tickets DESC,loss DESC,user_id LIMIT ?",
+                (day, limit),
+            ) as cur:
+                return await cur.fetchall()
+
+    async def jackpot_winners(self, limit: int = 5) -> list:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT winner_name,pool,day FROM jackpot_days WHERE drawn=1 AND winner_id IS NOT NULL "
+                "ORDER BY day DESC LIMIT ?",
+                (limit,),
+            ) as cur:
+                return await cur.fetchall()
+
+    async def draw_pending_jackpots(self, now: float | None = None) -> list[dict]:
+        """Draws all undrawn Moscow days before today; idle pools roll over."""
+        now = time.time() if now is None else now
+        today = jackpot_day_key(now)
+        outcomes = []
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT day,pool FROM jackpot_days WHERE day<? AND drawn=0 ORDER BY day", (today,)
+                ) as cur:
+                    days = await cur.fetchall()
+                for row in days:
+                    day, pool = row["day"], int(row["pool"])
+                    async with db.execute(
+                        "SELECT user_id,name,tickets FROM jackpot_players WHERE day=? AND tickets>0 "
+                        "ORDER BY user_id",
+                        (day,),
+                    ) as cur:
+                        players = await cur.fetchall()
+                    ticket_total = sum(int(player["tickets"]) for player in players)
+                    if ticket_total <= 0:
+                        await db.execute(
+                            "UPDATE jackpot_days SET drawn=1,drawn_at=? WHERE day=?", (now, day)
+                        )
+                        if pool:
+                            await db.execute("INSERT OR IGNORE INTO jackpot_days(day) VALUES (?)", (today,))
+                            await db.execute("UPDATE jackpot_days SET pool=pool+? WHERE day=?", (pool, today))
+                        outcomes.append({"kind": "carry", "day": day, "pool": pool})
+                        continue
+                    winning_ticket = secrets.SystemRandom().randint(1, ticket_total)
+                    cursor = 0
+                    winner = players[-1]
+                    for player in players:
+                        cursor += int(player["tickets"])
+                        if winning_ticket <= cursor:
+                            winner = player
+                            break
+                    await db.execute(
+                        "UPDATE jackpot_days SET drawn=1,winner_id=?,winner_name=?,drawn_at=? WHERE day=?",
+                        (winner["user_id"], winner["name"], now, day),
+                    )
+                    if pool:
+                        await db.execute(
+                            "INSERT INTO coins(user_id,balance) VALUES (?,?) "
+                            "ON CONFLICT(user_id) DO UPDATE SET balance=balance+?",
+                            (winner["user_id"], COINS_START + pool, pool),
+                        )
+                    outcomes.append({
+                        "kind": "winner", "day": day, "pool": pool,
+                        "user_id": int(winner["user_id"]), "name": winner["name"],
+                        "tickets": int(winner["tickets"]), "total_tickets": ticket_total,
+                    })
+                await db.commit()
+                return outcomes
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def create_mini_event(
+        self, kind: str, chat_id: str, reward: int, max_participants: int, duration: int
+    ) -> tuple[str, dict | None]:
+        if kind not in {"first", "first_n", "ticket"} or reward <= 0 or duration <= 0:
+            raise ValueError("Invalid mini event")
+        now = time.time()
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT id FROM mini_events WHERE chat_id=? AND status='active' LIMIT 1", (chat_id,)
+                ) as cur:
+                    active = await cur.fetchone()
+                if active:
+                    await db.rollback()
+                    return "active_exists", None
+                cursor = await db.execute(
+                    "INSERT INTO mini_events(kind,chat_id,reward,max_participants,ends,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (kind, chat_id, reward, max_participants, now + duration, now),
+                )
+                event_id = cursor.lastrowid
+                async with db.execute("SELECT * FROM mini_events WHERE id=?", (event_id,)) as cur:
+                    event = dict(await cur.fetchone())
+                await db.commit()
+                return "created", event
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def set_mini_event_message(self, event_id: int, message_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE mini_events SET message_id=? WHERE id=?", (message_id, event_id))
+            await db.commit()
+
+    async def join_mini_event(self, event_id: int, user_id: int, name: str) -> dict:
+        now = time.time()
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute("SELECT * FROM mini_events WHERE id=?", (event_id,)) as cur:
+                    event = await cur.fetchone()
+                if not event or event["status"] != "active":
+                    await db.rollback()
+                    return {"status": "finished"}
+                if event["ends"] <= now:
+                    await db.execute("UPDATE mini_events SET status='expired' WHERE id=?", (event_id,))
+                    await db.commit()
+                    return {"status": "expired"}
+                joined = await db.execute(
+                    "INSERT OR IGNORE INTO mini_event_players(event_id,user_id,name,joined_at) VALUES (?,?,?,?)",
+                    (event_id, user_id, name, now),
+                )
+                if joined.rowcount != 1:
+                    await db.rollback()
+                    return {"status": "already"}
+                async with db.execute(
+                    "SELECT COUNT(*) FROM mini_event_players WHERE event_id=?", (event_id,)
+                ) as cur:
+                    participant_count = int((await cur.fetchone())[0])
+                paid = event["kind"] in {"first", "first_n"}
+                complete = paid and participant_count >= event["max_participants"]
+                if paid:
+                    await db.execute(
+                        "INSERT INTO coins(user_id,balance) VALUES (?,?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET balance=balance+?",
+                        (user_id, COINS_START + event["reward"], event["reward"]),
+                    )
+                if complete:
+                    await db.execute("UPDATE mini_events SET status='completed' WHERE id=?", (event_id,))
+                await db.commit()
+                return {
+                    "status": "joined", "kind": event["kind"], "reward": int(event["reward"]),
+                    "count": participant_count, "max": int(event["max_participants"]), "complete": complete,
+                }
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def cancel_mini_event(self, chat_id: str) -> dict | None:
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT * FROM mini_events WHERE chat_id=? AND status='active' ORDER BY id DESC LIMIT 1", (chat_id,)
+                ) as cur:
+                    event = await cur.fetchone()
+                if not event:
+                    await db.rollback()
+                    return None
+                await db.execute("UPDATE mini_events SET status='cancelled' WHERE id=?", (event["id"],))
+                await db.commit()
+                return dict(event)
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def finish_due_mini_events(self, now: float | None = None) -> list[dict]:
+        now = time.time() if now is None else now
+        outcomes = []
+        async with aiosqlite.connect(self.path, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT * FROM mini_events WHERE status='active' AND ends<=? ORDER BY id", (now,)
+                ) as cur:
+                    events = await cur.fetchall()
+                for event in events:
+                    async with db.execute(
+                        "SELECT user_id,name FROM mini_event_players WHERE event_id=? ORDER BY joined_at,user_id",
+                        (event["id"],),
+                    ) as cur:
+                        players = await cur.fetchall()
+                    if event["kind"] == "ticket" and players:
+                        winner = secrets.SystemRandom().choice(players)
+                        await db.execute(
+                            "INSERT INTO coins(user_id,balance) VALUES (?,?) "
+                            "ON CONFLICT(user_id) DO UPDATE SET balance=balance+?",
+                            (winner["user_id"], COINS_START + event["reward"], event["reward"]),
+                        )
+                        await db.execute(
+                            "UPDATE mini_events SET status='completed',winner_id=?,winner_name=? WHERE id=?",
+                            (winner["user_id"], winner["name"], event["id"]),
+                        )
+                        outcomes.append({
+                            "kind": "ticket_winner", "event": dict(event), "count": len(players),
+                            "winner_id": int(winner["user_id"]), "winner_name": winner["name"],
+                        })
+                    else:
+                        await db.execute("UPDATE mini_events SET status='expired' WHERE id=?", (event["id"],))
+                        outcomes.append({"kind": "expired", "event": dict(event), "count": len(players)})
+                await db.commit()
+                return outcomes
             except Exception:
                 await db.rollback()
                 raise
@@ -2180,10 +2522,147 @@ async def bonus_notification_worker(bot: Bot) -> None:
 async def school_game(user, token, bet, won):
     damage, refund = await school_event.record(user.id, display_name(user), token,
         {"games": 1, "gamewin": int(won), "bets": bet}, loss=0 if won else bet)
+    if not won:
+        try:
+            await jackpot_loss(user, max(0, bet - refund), f"{token}:jackpot")
+        except Exception:
+            logger.exception("Could not add loss to jackpot")
     return f"\n📚 Урон боссу: {damage:,}. Возвращено: {refund:,} DC" if damage else ""
 
+
+async def jackpot_loss(user, loss: int, token: str) -> tuple[int, int, int]:
+    return await db.record_jackpot_loss(user.id, display_name(user), loss, token)
+
+
+async def jackpot_draw_task(bot: Bot) -> None:
+    tz = pytz.timezone("Europe/Moscow")
+    while True:
+        try:
+            outcomes = await db.draw_pending_jackpots()
+            for outcome in outcomes:
+                if outcome["kind"] != "winner":
+                    continue
+                announcement = (
+                    "🏆 Джекпот дня разыгран!\n\n"
+                    f"🎉 Победитель: {outcome['name']}\n"
+                    f"💰 Выигрыш: {outcome['pool']:,} DC\n"
+                    f"🎟 Билет: {outcome['tickets']} из {outcome['total_tickets']}\n\n"
+                    "Новый джекпот уже начал копиться!"
+                ).replace(",", " ")
+                try:
+                    await bot.send_message(MAIN_CHAT_ID, announcement)
+                except Exception as error:
+                    logger.warning("Could not announce jackpot winner: %s", error)
+                try:
+                    await bot.send_message(
+                        outcome["user_id"],
+                        f"🏆 Ты выиграл Джекпот дня!\n💰 На баланс зачислено: {outcome['pool']:,} DC".replace(",", " "),
+                    )
+                except Exception as error:
+                    logger.info("Could not notify jackpot winner: %s", error)
+        except Exception:
+            logger.exception("Jackpot draw task failed")
+        now = datetime.now(tz)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep(max(1, (next_midnight - now).total_seconds()))
+
+
+def mini_event_text(event: dict) -> str:
+    reward = f"{event['reward']:,}".replace(",", " ")
+    if event["kind"] == "first":
+        return (
+            "⚡ Быстрый мини-ивент!\n\n"
+            f"Первый, кто нажмёт кнопку, получит {reward} DC.\n"
+            "Успей забрать награду!"
+        )
+    if event["kind"] == "first_n":
+        return (
+            "⚡ Быстрый мини-ивент!\n\n"
+            f"Первые {event['max_participants']} участников получат по {reward} DC.\n"
+            "Нажми кнопку, чтобы участвовать."
+        )
+    return (
+        "🎟 Счастливый билет\n\n"
+        f"Нажми кнопку до окончания регистрации.\n"
+        f"Один участник случайно получит {reward} DC!"
+    )
+
+
+def mini_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Участвовать", callback_data=f"mini:join:{event_id}")],
+    ])
+
+
+@router.callback_query(F.data.startswith("mini:join:"))
+async def mini_event_join_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if await db.is_banned(callback.from_user.id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    try:
+        event_id = int(callback.data.removeprefix("mini:join:"))
+    except (AttributeError, ValueError):
+        await callback.answer("Событие не найдено.", show_alert=True)
+        return
+    result = await db.join_mini_event(event_id, callback.from_user.id, display_name(callback.from_user))
+    status = result["status"]
+    if status == "already":
+        await callback.answer("Ты уже участвуешь.", show_alert=True)
+        return
+    if status in {"finished", "expired"}:
+        await callback.answer("Событие уже завершено.", show_alert=True)
+        return
+    if result["kind"] == "ticket":
+        await callback.answer("🎟 Ты участвуешь в розыгрыше!")
+        return
+    message = f"✅ Награда {result['reward']:,} DC зачислена!".replace(",", " ")
+    if result["complete"]:
+        try:
+            await callback.message.edit_text(
+                "⚡ Мини-ивент завершён!\n\n"
+                f"Все {result['max']} наград уже забраны.",
+            )
+        except TelegramBadRequest:
+            pass
+    await callback.answer(message, show_alert=True)
+
+
+async def mini_event_task(bot: Bot) -> None:
+    while True:
+        try:
+            outcomes = await db.finish_due_mini_events()
+            for outcome in outcomes:
+                event = outcome["event"]
+                if outcome["kind"] == "ticket_winner":
+                    text = (
+                        "🎟 Счастливый билет разыгран!\n\n"
+                        f"🏆 Победитель: {outcome['winner_name']}\n"
+                        f"💰 Награда: {event['reward']:,} DC\n"
+                        f"👥 Участников: {outcome['count']}"
+                    ).replace(",", " ")
+                    try:
+                        await bot.send_message(event["chat_id"], text)
+                    except Exception as error:
+                        logger.warning("Could not publish mini event result: %s", error)
+                    try:
+                        await bot.send_message(
+                            outcome["winner_id"],
+                            f"🏆 Ты выиграл в событии «Счастливый билет»!\n"
+                            f"💰 Зачислено: {event['reward']:,} DC".replace(",", " "),
+                        )
+                    except Exception:
+                        pass
+                elif event["kind"] == "ticket":
+                    try:
+                        await bot.send_message(event["chat_id"], "⌛ Счастливый билет завершён: участников не было.")
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("Mini event task failed")
+        await asyncio.sleep(5)
+
 PLAIN_COMMANDS = {
-    "start", "help", "say", "vip", "unvip", "viplist",
+    "start", "help", "say", "channel", "mini", "vip", "unvip", "viplist",
     "ban", "unban", "banlist", "addmsgs", "removemsgs", "addday", "removeday",
     "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
@@ -2196,6 +2675,7 @@ PLAIN_COMMANDS = {
 
 RUSSIAN_COMMANDS = {
     "старт": "start", "начать": "start", "помощь": "help",
+    "канал": "channel", "мини": "mini",
     "кейсы": "cases", "баланс": "coins", "монеты": "coins",
     "обмен": "exchange", "бонус": "bonus", "стата": "stats",
     "статистика": "stats", "топ": "top", "победители": "winstop",
@@ -2240,6 +2720,7 @@ def start_keyboard(is_admin: bool = False, support_access: bool = False):
         [InlineKeyboardButton(text="🏫 Школьный ивент", callback_data="school:boss")],
         [InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"), InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0")],
         [InlineKeyboardButton(text="🎮 Игры", callback_data="games")],
+        [InlineKeyboardButton(text="🏆 Джекпот дня", callback_data="jackpot:view")],
         [InlineKeyboardButton(text="📦 Кейсы", callback_data="cases")],
         [InlineKeyboardButton(text="⭐ Купить D-COINS", callback_data="buy_dc_menu")],
         [InlineKeyboardButton(text="❓ Как играть", callback_data="help")],
@@ -2593,6 +3074,96 @@ async def cmd_say(message: Message, bot: Bot) -> None:
         await message.answer("✅ Сообщение отправлено в чат.")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить.\n\n📛 {e}")
+
+
+@router.message(Command("channel"), F.chat.type == "private")
+async def cmd_channel(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: канал ТЕКСТ\nПример: канал Сегодня будет мини-ивент!")
+        return
+    try:
+        await bot.send_message(REQUIRED_CHANNEL, parts[1].strip())
+        await message.answer("✅ Сообщение опубликовано в новостном канале.")
+    except Exception as error:
+        await message.answer(f"❌ Не удалось опубликовать в канале.\n\n📛 {error}")
+
+
+@router.message(Command("mini"), F.chat.type == "private")
+async def cmd_mini(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    usage = (
+        "Мини-ивенты публикуются в d_coins_channel:\n\n"
+        "мини первый СУММА\n"
+        "мини первые КОЛИЧЕСТВО СУММА\n"
+        "мини билет СЕКУНДЫ СУММА\n"
+        "мини отмена\n\n"
+        "Примеры:\nмини первый 5000\nмини первые 10 1000\nмини билет 60 15000"
+    )
+    if len(parts) < 2:
+        await message.answer(usage)
+        return
+    action = parts[1].lower()
+    if action in {"отмена", "cancel"}:
+        event = await db.cancel_mini_event(REQUIRED_CHANNEL)
+        if not event:
+            await message.answer("ℹ️ Активных мини-ивентов в канале нет.")
+            return
+        try:
+            if event.get("message_id"):
+                await bot.edit_message_text(
+                    chat_id=REQUIRED_CHANNEL,
+                    message_id=event["message_id"],
+                    text="❌ Мини-ивент отменён администратором.",
+                )
+            else:
+                await bot.send_message(REQUIRED_CHANNEL, "❌ Мини-ивент отменён администратором.")
+        except Exception:
+            pass
+        await message.answer("✅ Мини-ивент отменён.")
+        return
+    try:
+        if action in {"первый", "first"} and len(parts) == 3:
+            kind, max_players, reward, duration = "first", 1, int(parts[2]), 300
+        elif action in {"первые", "first_n"} and len(parts) == 4:
+            kind, max_players, reward, duration = "first_n", int(parts[2]), int(parts[3]), 300
+        elif action in {"билет", "ticket"} and len(parts) == 4:
+            kind, duration, reward = "ticket", int(parts[2]), int(parts[3])
+            max_players = 0
+        else:
+            await message.answer(usage)
+            return
+    except ValueError:
+        await message.answer("❌ Количество, время и награда должны быть целыми числами.\n\n" + usage)
+        return
+    if reward <= 0 or reward > 1_000_000_000:
+        await message.answer("❌ Награда должна быть от 1 до 1 000 000 000 DC.")
+        return
+    if kind == "first_n" and not 1 <= max_players <= 100:
+        await message.answer("❌ Можно указать от 1 до 100 участников.")
+        return
+    if not 10 <= duration <= 3600:
+        await message.answer("❌ Время события должно быть от 10 до 3 600 секунд.")
+        return
+    status, event = await db.create_mini_event(kind, REQUIRED_CHANNEL, reward, max_players, duration)
+    if status == "active_exists":
+        await message.answer("❌ В канале уже идёт мини-ивент. Заверши его или напиши: мини отмена")
+        return
+    try:
+        post = await bot.send_message(
+            REQUIRED_CHANNEL,
+            mini_event_text(event) + f"\n\n⏳ Время: {duration // 60} мин. {duration % 60} сек.",
+            reply_markup=mini_event_keyboard(event["id"]),
+        )
+        await db.set_mini_event_message(event["id"], post.message_id)
+        await message.answer(f"✅ Мини-ивент #{event['id']} опубликован в канале.")
+    except Exception as error:
+        await db.cancel_mini_event(REQUIRED_CHANNEL)
+        await message.answer(f"❌ Не удалось опубликовать событие.\n\n📛 {error}")
 
 @router.message(Command("vip"), F.chat.type == "private")
 async def cmd_vip(message: Message) -> None:
@@ -3910,6 +4481,9 @@ async def admin_commands_callback(callback: CallbackQuery) -> None:
         "createcasepromo КОД КЕЙС [КЛЮЧИ] [ЛИМИТ] [скрытый]\n"
         "promos / pending / premiumorders\n"
         "say ТЕКСТ — сообщение в основную группу\n"
+        "канал ТЕКСТ — публикация в новостном канале\n"
+        "мини первый СУММА / мини первые КОЛ-ВО СУММА\n"
+        "мини билет СЕКУНДЫ СУММА / мини отмена\n"
         "раздать СУММА — начислить DC всем пользователям бота\n"
         "раздать кейс НАЗВАНИЕ [КОЛ-ВО] — выдать всем ключи\n"
         "уронбоссу СУММА — вручную уменьшить HP босса\n"
@@ -4496,6 +5070,84 @@ async def main_menu_callback(callback: CallbackQuery, bot: Bot) -> None:
     await callback.message.edit_text(
         "👋 Добро пожаловать!\n\nВыберите действие:",
         reply_markup=start_keyboard(callback.from_user.id == ADMIN_ID, support_access),
+    )
+    await callback.answer()
+
+
+def jackpot_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Топ билетов", callback_data="jackpot:top"),
+         InlineKeyboardButton(text="🏅 Победители", callback_data="jackpot:winners")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="jackpot:view")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+
+
+def jackpot_next_draw_text() -> str:
+    tz = pytz.timezone("Europe/Moscow")
+    now = datetime.now(tz)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds = int((midnight - now).total_seconds())
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    return f"сегодня в 00:00 МСК (через {hours} ч. {minutes} мин.)"
+
+
+async def show_jackpot(callback: CallbackQuery) -> None:
+    summary = await db.jackpot_summary(callback.from_user.id)
+    if summary["tickets"] >= JACKPOT_TICKET_LIMIT:
+        ticket_note = "🎟 Лимит билетов на сегодня достигнут: 20 / 20."
+    else:
+        until_ticket = JACKPOT_TICKET_STEP - (summary["loss"] % JACKPOT_TICKET_STEP)
+        ticket_note = (
+            f"🎟 Твои билеты: {summary['tickets']} / {JACKPOT_TICKET_LIMIT}\n"
+            f"До следующего билета: {until_ticket:,} DC чистого проигрыша."
+        ).replace(",", " ")
+    text = (
+        "🏆 Джекпот дня\n\n"
+        f"💰 Банк: {summary['pool']:,} DC\n"
+        f"👥 Участников: {summary['players']}\n"
+        f"⏳ Розыгрыш: {jackpot_next_draw_text()}\n\n"
+        f"{ticket_note}\n\n"
+        "За каждые 5 000 DC чистого проигрыша в играх начисляется 1 билет.\n"
+        "Максимум — 20 билетов за день. Дуэли не участвуют."
+    ).replace(",", " ")
+    await callback.message.edit_text(text, reply_markup=jackpot_keyboard())
+
+
+@router.callback_query(F.data == "jackpot:view")
+async def jackpot_view_callback(callback: CallbackQuery) -> None:
+    if await db.is_banned(callback.from_user.id):
+        await callback.answer(BAN_MESSAGE, show_alert=True)
+        return
+    await show_jackpot(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "jackpot:top")
+async def jackpot_top_callback(callback: CallbackQuery) -> None:
+    rows = await db.jackpot_top()
+    if rows:
+        ranking = "\n".join(f"{index}. {row[0]} — {row[1]} бил." for index, row in enumerate(rows, 1))
+    else:
+        ranking = "Пока никто не получил билет."
+    await callback.message.edit_text(
+        f"📊 Топ билетов сегодня\n\n{ranking}", reply_markup=jackpot_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "jackpot:winners")
+async def jackpot_winners_callback(callback: CallbackQuery) -> None:
+    rows = await db.jackpot_winners()
+    if rows:
+        history = "\n".join(
+            f"• {row[2]} — {row[0]}: {row[1]:,} DC".replace(",", " ") for row in rows
+        )
+    else:
+        history = "Розыгрышей пока не было."
+    await callback.message.edit_text(
+        f"🏅 Последние победители\n\n{history}", reply_markup=jackpot_keyboard()
     )
     await callback.answer()
 
@@ -5508,6 +6160,7 @@ async def lottery_open_ticket(callback: CallbackQuery, bot: Bot) -> None:
             {"games": 1, "gamewin": 0, "bets": game["bet"]},
             loss=net_loss,
         )
+        await jackpot_loss(callback.from_user, max(0, net_loss - refund), f"lottery:{game['token']}:jackpot")
         boss_note = (
             f"\n📚 Урон боссу: {damage:,}. Возвращено: {refund:,} DC".replace(",", " ")
             if damage else ""
@@ -6052,7 +6705,7 @@ async def duel_accept_callback(callback: CallbackQuery, bot: Bot) -> None:
 # Обычные слова вместо команд со слешем. Этот обработчик расположен до
 # group_handler, поэтому команды не засчитываются как обычные сообщения.
 PRIVATE_PLAIN_COMMANDS = {
-    "start", "say", "vip", "unvip", "viplist", "ban",
+    "start", "say", "channel", "mini", "vip", "unvip", "viplist", "ban",
     "unban", "banlist", "addmsgs", "removemsgs", "addday", "removeday",
     "addcoins", "removecoins", "addvisual", "removevisual", "createpromo", "deletepromo", "createcasepromo",
     "promos", "balance", "popolnit", "sendgift",
@@ -6062,14 +6715,15 @@ PRIVATE_PLAIN_COMMANDS = {
 }
 GROUP_PLAIN_COMMANDS = {"stats", "top", "winstop", "cointop", "daytop"}
 BOT_ARGUMENT_COMMANDS = {
-    "start", "say", "balance", "popolnit", "sendgift",
+    "start", "say", "channel", "mini", "balance", "popolnit", "sendgift",
     "createpromo", "createcasepromo",
     "pending", "deliver", "premiumdone", "premiumrefund", "transfer", "slots", "roulette", "dice", "scratch", "coinflip", "lottery", "admin",
     "supportgrant", "supportrevoke", "supportreply", "supportclose",
 }
 PLAIN_COMMAND_HANDLERS = {
     "start": cmd_start, "help": cmd_help,
-    "say": cmd_say, "vip": cmd_vip, "unvip": cmd_unvip, "viplist": cmd_viplist,
+    "say": cmd_say, "channel": cmd_channel, "mini": cmd_mini,
+    "vip": cmd_vip, "unvip": cmd_unvip, "viplist": cmd_viplist,
     "ban": cmd_ban, "unban": cmd_unban, "banlist": cmd_banlist,
     "addmsgs": cmd_addmsgs, "removemsgs": cmd_removemsgs,
     "addday": cmd_addday, "removeday": cmd_removeday,
@@ -6340,6 +6994,8 @@ async def main() -> None:
     dp  = Dispatcher()
     dp.include_router(router)
     asyncio.create_task(daily_reset_task(bot))
+    asyncio.create_task(jackpot_draw_task(bot))
+    asyncio.create_task(mini_event_task(bot))
     asyncio.create_task(casino_timeout_checker(bot))
     asyncio.create_task(duel_timeout_checker(bot))
     asyncio.create_task(school_notifications(bot))
