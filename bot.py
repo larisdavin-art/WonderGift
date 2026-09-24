@@ -7938,10 +7938,18 @@ async def ingest(bot, store, stop):
             if updates:
                 offset = updates[-1].update_id + 1
         except TelegramConflictError:
-            logger.critical("Another poller uses this token; stopping")
-            raise
+            # Второй процесс с тем же токеном может кратковременно появиться во
+            # время Railway redeploy. Не останавливаем весь бот: ждём и снова
+            # пытаемся забрать polling.
+            logger.error("Another poller uses this token; retrying in 10 seconds")
+            await asyncio.sleep(10)
         except (TelegramNetworkError, TelegramRetryAfter) as exc:
             await asyncio.sleep(getattr(exc, "retry_after", 3))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Polling failed; retrying in 5 seconds")
+            await asyncio.sleep(5)
 
 
 async def process_one(dp, bot, store):
@@ -8000,6 +8008,21 @@ async def periodic(bot, store, function, interval):
         except Exception:
             logger.exception("Periodic task %s failed", function.__name__)
         await asyncio.sleep(interval)
+
+
+async def supervise(name, factory, stop):
+    """Не даёт одной фоновой задаче выключить весь бот."""
+    while not stop.is_set():
+        try:
+            await factory()
+            if not stop.is_set():
+                logger.error("Worker %s stopped unexpectedly; restarting", name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Worker %s crashed; restarting", name)
+        if not stop.is_set():
+            await asyncio.sleep(3)
 
 
 async def runtime_issues(message: Message):
@@ -8101,10 +8124,18 @@ async def main():
                 await bot.delete_webhook(drop_pending_updates=False)
             await resolve_channel_chat(bot)
             tasks = [
-                asyncio.create_task(ingest(bot, store, stop), name="polling"),
-                asyncio.create_task(consume(dp, bot, store), name="updates"),
-                asyncio.create_task(gift_worker(bot, store.path), name="gifts"),
-                asyncio.create_task(notice_worker(bot, store.path), name="notices"),
+                asyncio.create_task(
+                    supervise("polling", lambda: ingest(bot, store, stop), stop), name="polling"
+                ),
+                asyncio.create_task(
+                    supervise("updates", lambda: consume(dp, bot, store), stop), name="updates"
+                ),
+                asyncio.create_task(
+                    supervise("gifts", lambda: gift_worker(bot, store.path), stop), name="gifts"
+                ),
+                asyncio.create_task(
+                    supervise("notices", lambda: notice_worker(bot, store.path), stop), name="notices"
+                ),
             ]
             for function, interval in (
                 (casino_timeout_checker, 5),
@@ -8116,14 +8147,16 @@ async def main():
                 (daily_reset_task, 3600),
             ):
                 tasks.append(
-                    asyncio.create_task(periodic(bot, store, function, interval), name=function.__name__)
+                    asyncio.create_task(
+                        supervise(
+                            function.__name__,
+                            lambda function=function, interval=interval: periodic(bot, store, function, interval),
+                            stop,
+                        ),
+                        name=function.__name__,
+                    )
                 )
-            stopped = asyncio.create_task(stop.wait(), name="shutdown")
-            tasks.append(stopped)
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                if task is not stopped:
-                    task.result()
+            await stop.wait()
         finally:
             for task in tasks:
                 task.cancel()
