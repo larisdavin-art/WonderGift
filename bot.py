@@ -8010,6 +8010,18 @@ async def periodic(bot, store, function, interval):
         await asyncio.sleep(interval)
 
 
+async def background_periodic(bot, function, interval):
+    """Безопасный запуск служебных задач без блокировки обработки команд."""
+    while True:
+        try:
+            await function(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Background task %s failed", function.__name__)
+        await asyncio.sleep(interval)
+
+
 async def supervise(name, factory, stop):
     """Не даёт одной фоновой задаче выключить весь бот."""
     while not stop.is_set():
@@ -8078,91 +8090,55 @@ async def resolve_gift(message: Message):
 async def main():
     validate_config()
     Path(db.path).resolve().parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(Path(db.path).resolve()) + ".polling.lock", timeout=0):
-        await db.init()
-        await school_event.init()
-        await load_runtime_settings()
-        state = {
-            name: globals()[name]
-            for name in (
-                "active_games",
-                "pending_game_bets",
-                "active_duels",
-                "duel_by_user",
-                "cooldowns",
-                "casino_bet_cooldowns",
-                "case_open_cooldowns",
-                "duel_cooldowns",
-                "ECONOMY",
-                "STAR_DC_PACKAGES",
-                "CASES",
-            )
-        }
-        store = Store(db.path, state)
-        await store.init()
-        bot = Bot(TOKEN, session=AiohttpSession(timeout=10))
-        bot.session.middleware(TelegramTransport())
-        dp = Dispatcher(disable_fsm=True)
-        dp.message.register(payments_support, Command("paysupport"))
-        dp.message.register(runtime_issues, Command("runtimeissues"))
-        dp.message.register(resolve_gift, Command("giftresolve"))
-        dp.include_router(router)
-        dp.message.outer_middleware(Guard())
-        dp.callback_query.outer_middleware(Guard())
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except NotImplementedError:
-                signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
-        tasks = []
-        try:
-            info = await bot.get_webhook_info()
-            if info.url:
-                logging.warning("Активен webhook %s; отключаю его для polling.", info.url)
-                await bot.delete_webhook(drop_pending_updates=False)
-            await resolve_channel_chat(bot)
-            tasks = [
+    await db.init()
+    await school_event.init()
+    await load_runtime_settings()
+    bot = Bot(TOKEN, session=AiohttpSession(timeout=10))
+    bot.session.middleware(TelegramTransport())
+    dp = Dispatcher(disable_fsm=True)
+    dp.message.register(payments_support, Command("paysupport"))
+    dp.message.register(runtime_issues, Command("runtimeissues"))
+    dp.message.register(resolve_gift, Command("giftresolve"))
+    dp.include_router(router)
+    dp.message.outer_middleware(Guard())
+    dp.callback_query.outer_middleware(Guard())
+    background = []
+    try:
+        info = await bot.get_webhook_info()
+        if info.url:
+            logging.warning("Активен webhook %s; отключаю его для polling.", info.url)
+            await bot.delete_webhook(drop_pending_updates=False)
+        await resolve_channel_chat(bot)
+        background = [
+            asyncio.create_task(gift_worker(bot, db.path), name="gifts"),
+            asyncio.create_task(notice_worker(bot, db.path), name="notices"),
+        ]
+        for function, interval in (
+            (casino_timeout_checker, 5),
+            (duel_timeout_checker, 5),
+            (school_notifications, 5),
+            (bonus_notification_worker, 2),
+            (mini_event_task, 5),
+            (jackpot_draw_task, 30),
+            (daily_reset_task, 3600),
+        ):
+            background.append(
                 asyncio.create_task(
-                    supervise("polling", lambda: ingest(bot, store, stop), stop), name="polling"
-                ),
-                asyncio.create_task(
-                    supervise("updates", lambda: consume(dp, bot, store), stop), name="updates"
-                ),
-                asyncio.create_task(
-                    supervise("gifts", lambda: gift_worker(bot, store.path), stop), name="gifts"
-                ),
-                asyncio.create_task(
-                    supervise("notices", lambda: notice_worker(bot, store.path), stop), name="notices"
-                ),
-            ]
-            for function, interval in (
-                (casino_timeout_checker, 5),
-                (duel_timeout_checker, 5),
-                (school_notifications, 5),
-                (bonus_notification_worker, 2),
-                (mini_event_task, 5),
-                (jackpot_draw_task, 30),
-                (daily_reset_task, 3600),
-            ):
-                tasks.append(
-                    asyncio.create_task(
-                        supervise(
-                            function.__name__,
-                            lambda function=function, interval=interval: periodic(bot, store, function, interval),
-                            stop,
-                        ),
-                        name=function.__name__,
-                    )
+                    background_periodic(bot, function, interval), name=function.__name__
                 )
-            await stop.wait()
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await dp.storage.close()
-            await bot.session.close()
+            )
+        logger.info("Bot started with standard Telegram polling")
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            close_bot_session=False,
+        )
+    finally:
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
+        await dp.storage.close()
+        await bot.session.close()
 
 
 # ==================== MAINTENANCE ====================
