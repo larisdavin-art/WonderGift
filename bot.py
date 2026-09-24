@@ -45,9 +45,9 @@ COOLDOWN_SECONDS   = 1
 START_CHANCE       = 0.1
 STEP               = 0.002
 MAX_CHANCE         = 100.0
-# Розыгрыш подарка за общение: диапазон 0..2000 вдвое реже прежнего 0..1000.
+# Розыгрыш подарка за общение: диапазон 0..4000, вдвое реже прежнего 0..2000.
 # Накопленный и купленный шанс игроков при этом сохраняется.
-GIFT_WIN_ROLL_MAX  = 2000.0
+GIFT_WIN_ROLL_MAX  = 4000.0
 BONUS_COOLDOWN     = 43200
 
 # D-COINS
@@ -68,12 +68,14 @@ JACKPOT_PERCENT = 2
 JACKPOT_TICKET_STEP = 5_000
 JACKPOT_TICKET_LIMIT = 20
 SCRATCH_SYMBOLS = ("🌈", "🔥", "🍓", "🍒", "🍋", "💎")
-SCRATCH_WIN_CHANCE = 0.30
+SCRATCH_WIN_CHANCE = 0.20
 SCRATCH_MULTIPLIER = 3
 LOTTERY_MULTIPLIERS = (
-    [3.0] + [2.5] + [2.0] * 3 + [1.5] * 5 +
-    [1.0] * 3 + [0.5] * 2 + [0.0] * 10
+    [3.0] + [2.5] + [2.0] * 2 + [1.5] * 4 +
+    [1.0] * 2 + [0.5] * 2 + [0.0] * 13
 )
+SLOT_SYMBOLS = ("🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🍉", "🔔")
+ROULETTE_WHEEL = ("red",) * 16 + ("black",) * 16 + ("green",) * 5
 PANDORA_COOLDOWN = 5 * 86400
 PANDORA_REWARDS = (
     ("coins", 1_000, 22), ("coins", 3_000, 18), ("coins", 5_000, 14),
@@ -1866,6 +1868,8 @@ SCHOOL_BOSSES = {
         "top_text": "🥇 NFT · 🥈 NFT · 🥉 NFT",
     },
 }
+MAGISTER_SEAL_HP = 3_000_000
+MAGISTER_SEAL_COUNT = 3
 
 LOSS_SHARE_MIN_AMOUNT = 10_000
 
@@ -1902,7 +1906,7 @@ class SchoolEvent:
     async def init(self):
         async with self.transaction() as c:
             for sql in (
-                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER, boss_stage INTEGER DEFAULT 1)",
+                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER, boss_stage INTEGER DEFAULT 1, seal_stage INTEGER DEFAULT 0)",
                 "CREATE TABLE IF NOT EXISTS school_players (season INTEGER, uid INTEGER, name TEXT, knowledge INTEGER DEFAULT 0, damage INTEGER DEFAULT 0, reached REAL DEFAULT 0, last_message REAL DEFAULT 0, PRIMARY KEY(season,uid))",
                 "CREATE TABLE IF NOT EXISTS school_quests (season INTEGER, uid INTEGER, day TEXT, quest TEXT, progress INTEGER DEFAULT 0, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day,quest))",
                 "CREATE TABLE IF NOT EXISTS school_days (season INTEGER, uid INTEGER, day TEXT, streak INTEGER, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day))",
@@ -1920,6 +1924,8 @@ class SchoolEvent:
                 season_columns = {row[1] for row in await cur.fetchall()}
             if "boss_stage" not in season_columns:
                 await c.execute("ALTER TABLE school_seasons ADD COLUMN boss_stage INTEGER DEFAULT 1")
+            if "seal_stage" not in season_columns:
+                await c.execute("ALTER TABLE school_seasons ADD COLUMN seal_stage INTEGER DEFAULT 0")
 
             # Если Архимеда победили до установки этого обновления, второй босс
             # появляется при первом запуске новой версии. Знания и путь сохраняются,
@@ -1932,7 +1938,7 @@ class SchoolEvent:
                 defeated_legacy_seasons = [row[0] for row in await cur.fetchall()]
             for season_id in defeated_legacy_seasons:
                 await c.execute(
-                    "UPDATE school_seasons SET boss_stage=2,hp=?,max_hp=?,killed=NULL WHERE id=?",
+                    "UPDATE school_seasons SET boss_stage=2,hp=?,max_hp=?,seal_stage=0,killed=NULL WHERE id=?",
                     (SCHOOL_BOSSES[2]["max_hp"], SCHOOL_BOSSES[2]["max_hp"], season_id),
                 )
                 await c.execute(
@@ -2039,14 +2045,62 @@ class SchoolEvent:
                 day = await self.prepare(c, sid, uid, name, now)
                 await self.progress(c, sid, uid, name, day, now, metrics or {})
             damage = refund = 0
+            phase_reborn = False
             if loss > 0 and season["hp"] > 0:
-                damage = min(int(loss), season["hp"])
+                stage = int(season["boss_stage"] or 1)
+                seals = int(season["seal_stage"] or 0)
+                damage_limit = int(season["hp"])
+                # До первой печати Магистра нельзя перескочить отметку 3 млн.
+                # Излишек последней ставки возвращается так же, как при добивании HP.
+                if stage == 2 and seals == 0 and season["hp"] > MAGISTER_SEAL_HP:
+                    damage_limit = int(season["hp"]) - MAGISTER_SEAL_HP
+                damage = min(int(loss), damage_limit)
                 refund = int(loss) - damage
                 if not manual:
                     await c.execute("UPDATE school_players SET damage=damage+?, reached=? WHERE season=? AND uid=?", (damage, now, sid, uid))
                 await c.execute("UPDATE school_seasons SET hp=hp-? WHERE id=?", (damage, sid))
                 if refund and not manual:
                     await self.coins(c, uid, refund)
+
+                remaining_hp = int(season["hp"]) - damage
+                if stage == 2 and seals == 0 and remaining_hp == MAGISTER_SEAL_HP:
+                    await c.execute(
+                        "UPDATE school_seasons SET seal_stage=1,max_hp=? WHERE id=?",
+                        (MAGISTER_SEAL_HP, sid),
+                    )
+                    await c.execute(
+                        "INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)",
+                        (
+                            sid,
+                            "magister-seal:1",
+                            "🔮 Первая печать снята!\n\n"
+                            "Игроки пробили первую защиту Магистра Забвений.\n"
+                            "❤️ Осталось: 3 000 000 HP\n\n"
+                            "Впереди ещё две печати.",
+                        ),
+                    )
+                elif stage == 2 and remaining_hp == 0 and 1 <= seals < MAGISTER_SEAL_COUNT:
+                    next_seal = seals + 1
+                    seal_text = (
+                        "🔮 Вторая печать снята!\n\n"
+                        "Магистр Забвений высвободил новую силу.\n"
+                        "❤️ Новая линия здоровья: 3 000 000 HP\n\n"
+                        "Осталась последняя печать."
+                        if next_seal == 2 else
+                        "🔮 Третья печать снята!\n\n"
+                        "Последняя защита Магистра разрушена.\n"
+                        "❤️ Финальная линия здоровья: 3 000 000 HP\n\n"
+                        "Теперь его можно победить окончательно."
+                    )
+                    await c.execute(
+                        "UPDATE school_seasons SET hp=?,max_hp=?,seal_stage=? WHERE id=?",
+                        (MAGISTER_SEAL_HP, MAGISTER_SEAL_HP, next_seal, sid),
+                    )
+                    await c.execute(
+                        "INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)",
+                        (sid, f"magister-seal:{next_seal}", seal_text),
+                    )
+                    phase_reborn = True
 
                 # Редкое перераспределение проигрыша: полный урон остаётся боссу,
                 # а половина реально потерянной суммы начисляется случайному
@@ -2074,7 +2128,7 @@ class SchoolEvent:
                                 f"игрока {name}.".replace(",", " "),
                             ),
                         )
-                if damage == season["hp"]:
+                if damage == season["hp"] and not phase_reborn:
                     stage = int(season["boss_stage"] or 1)
                     boss = SCHOOL_BOSSES.get(stage, SCHOOL_BOSSES[2])
                     await c.execute("UPDATE school_seasons SET killed=? WHERE id=?", (now, sid))
@@ -2105,7 +2159,7 @@ class SchoolEvent:
                             ),
                         )
                         await c.execute(
-                            "UPDATE school_seasons SET boss_stage=2,hp=?,max_hp=?,killed=NULL WHERE id=?",
+                            "UPDATE school_seasons SET boss_stage=2,hp=?,max_hp=?,seal_stage=0,killed=NULL WHERE id=?",
                             (SCHOOL_BOSSES[2]["max_hp"], SCHOOL_BOSSES[2]["max_hp"], sid),
                         )
                         await c.execute("UPDATE school_players SET damage=0,reached=0 WHERE season=?", (sid,))
@@ -2310,6 +2364,8 @@ async def event_page(uid, name, page):
             else:
                 hours = max(0, int((season["ends"] - now) / 3600))
                 text = f"{boss['name']}\n❤️ {season['hp']:,} / {season['max_hp']:,} HP\n⚔️ Твой урон: {p['damage'] if p else 0:,}\n🏆 Твоё место: {rank}\n⏳ Осталось: {hours // 24} д. {hours % 24} ч."
+                if stage == 2:
+                    text += f"\n🔮 Снято печатей: {int(season['seal_stage'] or 0)} / {MAGISTER_SEAL_COUNT}"
                 text += "\n\nПроигранные ставки наносят урон. Дуэли не учитываются. Очки знаний идут только в призовой путь."
                 if stage == 1:
                     text += "\nЗа победу: от 10 000 урона — 10 000 DC; от 100 000 — также ключ Отличника. Последний удар: 50 000 DC. После победы появится Магистр Забвений."
@@ -5400,10 +5456,9 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
         await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
-    SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎"]
-    s1 = random.choice(SYMBOLS)
-    s2 = random.choice(SYMBOLS)
-    s3 = random.choice(SYMBOLS)
+    s1 = random.choice(SLOT_SYMBOLS)
+    s2 = random.choice(SLOT_SYMBOLS)
+    s3 = random.choice(SLOT_SYMBOLS)
 
     if s1 == s2 == s3:
         win = bet * 2
@@ -5477,7 +5532,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
 
-    result_color = random.choice(["red"] * 18 + ["black"] * 18 + ["green"])
+    result_color = random.choice(ROULETTE_WHEEL)
     emoji_map = {"red": "🔴", "black": "⚫", "green": "🟢"}
     result_emoji = emoji_map[result_color]
     chosen_emoji = "🔴" if color == "red" else "⚫"
@@ -5664,19 +5719,19 @@ async def cmd_coinflip(message: Message, bot: Bot) -> None:
 # =========================
 
 MINES_GRID_SIZE = 25
-MINES_COUNT = 6
+MINES_COUNT = 8
 
 def mines_multiplier(safe_opened: int) -> float:
-    """Коэффициент для поля 5×5 с шестью минами."""
+    """Коэффициент для поля 5×5 с восемью минами."""
     if safe_opened <= 0:
         return 0.0
-    # Первые два коэффициента совпадают с привычной механикой игры.
+    # Первые два коэффициента показываются сразу и не зависят от округления.
     if safe_opened == 1:
-        return 1.28
+        return 1.18
     if safe_opened == 2:
-        return 1.65
+        return 1.42
     fair_multiplier = comb(MINES_GRID_SIZE, safe_opened) / comb(MINES_GRID_SIZE - MINES_COUNT, safe_opened)
-    return round(fair_multiplier * 0.94, 2)
+    return round(fair_multiplier * 0.90, 2)
 
 def mines_prize(bet: int, safe_opened: int) -> int:
     return int(bet * mines_multiplier(safe_opened))
