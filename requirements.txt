@@ -1,5 +1,6 @@
-aiogram
-aiosqlite
-pytz
-cachetools
-python-dotenv
+aiogram==3.31.0
+aiosqlite==0.22.1
+cachetools>=5.5,<7
+python-dotenv>=1.0,<2
+pytz>=2025.2
+filelock>=3.18,<4
