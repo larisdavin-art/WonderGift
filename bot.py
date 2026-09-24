@@ -8097,7 +8097,8 @@ async def main():
         try:
             info = await bot.get_webhook_info()
             if info.url:
-                raise RuntimeError("Активен webhook. Отключите его явно перед запуском polling.")
+                logging.warning("Активен webhook %s; отключаю его для polling.", info.url)
+                await bot.delete_webhook(drop_pending_updates=False)
             await resolve_channel_chat(bot)
             tasks = [
                 asyncio.create_task(ingest(bot, store, stop), name="polling"),
