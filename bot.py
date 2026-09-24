@@ -2364,8 +2364,10 @@ async def event_page(uid, name, page):
             else:
                 hours = max(0, int((season["ends"] - now) / 3600))
                 text = f"{boss['name']}\n❤️ {season['hp']:,} / {season['max_hp']:,} HP\n⚔️ Твой урон: {p['damage'] if p else 0:,}\n🏆 Твоё место: {rank}\n⏳ Осталось: {hours // 24} д. {hours % 24} ч."
-                if stage == 2:
-                    text += f"\n🔮 Снято печатей: {int(season['seal_stage'] or 0)} / {MAGISTER_SEAL_COUNT}"
+                seals_removed = int(season["seal_stage"] or 0)
+                # До отметки в 3 млн печати не упоминаются вовсе.
+                if stage == 2 and seals_removed:
+                    text += f"\n🔮 Снято печатей: {seals_removed} / {MAGISTER_SEAL_COUNT}"
                 text += "\n\nПроигранные ставки наносят урон. Дуэли не учитываются. Очки знаний идут только в призовой путь."
                 if stage == 1:
                     text += "\nЗа победу: от 10 000 урона — 10 000 DC; от 100 000 — также ключ Отличника. Последний удар: 50 000 DC. После победы появится Магистр Забвений."
