@@ -141,11 +141,11 @@ JACKPOT_PERCENT = 2
 JACKPOT_TICKET_STEP = 5000
 JACKPOT_TICKET_LIMIT = 20
 SCRATCH_SYMBOLS = ("🌈", "🔥", "🍓", "🍒", "🍋", "💎")
-SCRATCH_WIN_CHANCE = 0.2
+SCRATCH_WIN_CHANCE = 0.05
 SCRATCH_MULTIPLIER = 3
-LOTTERY_MULTIPLIERS = [3.0] + [2.5] + [2.0] * 2 + [1.5] * 4 + [1.0] * 2 + [0.5] * 2 + [0.0] * 13
-SLOT_SYMBOLS = ("🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🍉", "🔔")
-ROULETTE_WHEEL = ("red",) * 16 + ("black",) * 16 + ("green",) * 5
+LOTTERY_MULTIPLIERS = [3.0] + [2.0] + [1.5] + [1.0] + [0.5] * 2 + [0.0] * 19
+SLOT_SYMBOLS = ("🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🍉", "🔔", "🍀", "🔷", "🎲", "🎯")
+ROULETTE_WHEEL = ("red",) * 10 + ("black",) * 10 + ("green",) * 17
 PANDORA_COOLDOWN = 5 * 86400
 PANDORA_REWARDS = (
     ("coins", 1000, 22),
@@ -407,7 +407,7 @@ GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT = 100000
 GOLDEN_HOUR_KNOWLEDGE_LIMIT = 500
 GOLDEN_HOUR_GAMES_LIMIT = 20
 MINES_GRID_SIZE = 25
-MINES_COUNT = 8
+MINES_COUNT = 12
 MAX_BET = 1000000000
 
 
