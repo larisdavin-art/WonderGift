@@ -396,6 +396,10 @@ SCHOOL_BOSSES = {
 MAGISTER_SEAL_HP = 3000000
 MAGISTER_SEAL_COUNT = 3
 LOSS_SHARE_MIN_AMOUNT = 10000
+GOLDEN_HOUR_SECONDS = 3600
+GOLDEN_HOUR_DAMAGE_LIMIT = 100000
+GOLDEN_HOUR_KNOWLEDGE_LIMIT = 500
+GOLDEN_HOUR_GAMES_LIMIT = 20
 MINES_GRID_SIZE = 25
 MINES_COUNT = 8
 MAX_BET = 1000000000
@@ -1904,6 +1908,8 @@ class SchoolEvent:
                 "CREATE TABLE IF NOT EXISTS school_actions (season INTEGER, uid INTEGER, token TEXT, PRIMARY KEY(season,uid,token))",
                 "CREATE TABLE IF NOT EXISTS school_prizes (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, uid INTEGER, reason TEXT, kind TEXT, amount INTEGER, done INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, UNIQUE(season,uid,reason,kind))",
                 "CREATE TABLE IF NOT EXISTS school_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, tag TEXT, text TEXT, sent INTEGER DEFAULT 0, UNIQUE(season,tag))",
+                "CREATE TABLE IF NOT EXISTS golden_hours (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER NOT NULL, started REAL NOT NULL, ends REAL NOT NULL, finished REAL)",
+                "CREATE TABLE IF NOT EXISTS golden_hour_players (hour INTEGER NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, bonus_damage INTEGER NOT NULL DEFAULT 0, bonus_knowledge INTEGER NOT NULL DEFAULT 0, games INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(hour,uid))",
             ):
                 await c.execute(sql)
             async with c.execute("PRAGMA table_info(school_prizes)") as cur:
@@ -1936,6 +1942,67 @@ class SchoolEvent:
         if active and row and (row["stopped"] or (now or time.time()) >= row["ends"]):
             return None
         return row
+
+    async def active_golden_hour(self, c, season, now):
+        return await self.one(
+            c,
+            "SELECT * FROM golden_hours WHERE season=? AND finished IS NULL AND ends>? ORDER BY id DESC LIMIT 1",
+            (season, now),
+        )
+
+    async def golden_hour_status(self, now=None):
+        now = time.time() if now is None else now
+        async with self.transaction() as c:
+            season = await self.current(c, now)
+            if not season:
+                return None
+            return await self.active_golden_hour(c, season["id"], now)
+
+    async def start_golden_hour(self, now=None):
+        now = time.time() if now is None else now
+        async with self.transaction() as c:
+            season = await self.current(c, now)
+            if not season:
+                return ("no_event", None)
+            existing = await self.active_golden_hour(c, season["id"], now)
+            if existing:
+                return ("active", existing)
+            await c.execute(
+                "INSERT INTO golden_hours(season,started,ends) VALUES (?,?,?)",
+                (season["id"], now, now + GOLDEN_HOUR_SECONDS),
+            )
+            return ("started", await self.one(c, "SELECT * FROM golden_hours WHERE id=last_insert_rowid()"))
+
+    async def stop_golden_hour(self, now=None):
+        now = time.time() if now is None else now
+        async with self.transaction() as c:
+            season = await self.current(c, now)
+            if not season:
+                return False
+            hour = await self.active_golden_hour(c, season["id"], now)
+            if not hour:
+                return False
+            await c.execute("UPDATE golden_hours SET ends=? WHERE id=?", (now, hour["id"]))
+            return True
+
+    async def finish_golden_hours(self, now=None):
+        now = time.time() if now is None else now
+        outcomes = []
+        async with self.transaction() as c:
+            async with c.execute(
+                "SELECT * FROM golden_hours WHERE finished IS NULL AND ends<=? ORDER BY id",
+                (now,),
+            ) as cur:
+                hours = await cur.fetchall()
+            for hour in hours:
+                async with c.execute(
+                    "SELECT name,bonus_damage,bonus_knowledge,games FROM golden_hour_players WHERE hour=? ORDER BY bonus_damage DESC,games DESC,uid LIMIT 3",
+                    (hour["id"],),
+                ) as cur:
+                    top = await cur.fetchall()
+                await c.execute("UPDATE golden_hours SET finished=? WHERE id=?", (now, hour["id"]))
+                outcomes.append((hour, top))
+        return outcomes
 
     async def start(self):
         async with self.transaction() as c:
@@ -2074,6 +2141,13 @@ class SchoolEvent:
             if not manual:
                 day = await self.prepare(c, sid, uid, name, now)
                 await self.progress(c, sid, uid, name, day, now, metrics or {})
+            golden = None if manual else await self.active_golden_hour(c, sid, now)
+            if golden and int((metrics or {}).get("games", 0)):
+                await c.execute(
+                    "INSERT INTO golden_hour_players(hour,uid,name,games) VALUES (?,?,?,?) "
+                    "ON CONFLICT(hour,uid) DO UPDATE SET name=excluded.name,games=MIN(?,golden_hour_players.games+excluded.games)",
+                    (golden["id"], uid, name, 1, GOLDEN_HOUR_GAMES_LIMIT),
+                )
             damage = refund = 0
             phase_reborn = False
             if loss > 0 and season["hp"] > 0:
@@ -2082,8 +2156,33 @@ class SchoolEvent:
                 damage_limit = int(season["hp"])
                 if stage == 2 and seals == 0 and (season["hp"] > MAGISTER_SEAL_HP):
                     damage_limit = int(season["hp"]) - MAGISTER_SEAL_HP
-                damage = min(int(loss), damage_limit)
-                refund = int(loss) - damage
+                base_damage = min(int(loss), damage_limit)
+                damage = base_damage
+                refund = int(loss) - base_damage
+                if golden and base_damage:
+                    player = await self.one(
+                        c,
+                        "SELECT bonus_damage FROM golden_hour_players WHERE hour=? AND uid=?",
+                        (golden["id"], uid),
+                    )
+                    used_bonus = int(player[0]) if player else 0
+                    extra_damage = min(
+                        base_damage,
+                        max(0, GOLDEN_HOUR_DAMAGE_LIMIT - used_bonus),
+                        max(0, damage_limit - base_damage),
+                    )
+                    if extra_damage:
+                        damage += extra_damage
+                        await c.execute(
+                            "INSERT INTO golden_hour_players(hour,uid,name,bonus_damage) VALUES (?,?,?,?) "
+                            "ON CONFLICT(hour,uid) DO UPDATE SET name=excluded.name,bonus_damage=golden_hour_players.bonus_damage+excluded.bonus_damage",
+                            (
+                                golden["id"],
+                                uid,
+                                name,
+                                extra_damage,
+                            ),
+                        )
                 if not manual:
                     await c.execute(
                         "UPDATE school_players SET damage=damage+?, reached=? WHERE season=? AND uid=?",
@@ -2122,7 +2221,7 @@ class SchoolEvent:
                         (sid, f"magister-seal:{next_seal}", seal_text),
                     )
                     phase_reborn = True
-                share_chance = 0 if manual else loss_share_chance(damage)
+                share_chance = 0 if manual else loss_share_chance(base_damage)
                 if share_chance and random.random() < share_chance:
                     async with c.execute(
                         "SELECT uid,name FROM school_players WHERE season=? AND damage>0 ORDER BY damage DESC,reached,uid LIMIT 10",
@@ -2132,7 +2231,7 @@ class SchoolEvent:
                     candidates = [player for player in top_ten if player["uid"] != uid]
                     if candidates:
                         recipient = random.choice(candidates)
-                        share_amount = damage // 2
+                        share_amount = base_damage // 2
                         await self.coins(c, recipient["uid"], share_amount)
                         await c.execute(
                             "INSERT OR IGNORE INTO school_outbox(season,tag,text) VALUES (?,?,?)",
@@ -2270,9 +2369,26 @@ class SchoolEvent:
                 )
                 _, _, _, dc, points = QUESTS[qid]
                 await self.coins(c, uid, dc)
+                golden = await self.active_golden_hour(c, sid, now)
+                bonus_points = 0
+                if golden:
+                    golden_player = await self.one(
+                        c,
+                        "SELECT bonus_knowledge FROM golden_hour_players WHERE hour=? AND uid=?",
+                        (golden["id"], uid),
+                    )
+                    used_bonus = int(golden_player[0]) if golden_player else 0
+                    bonus_points = min(points, max(0, GOLDEN_HOUR_KNOWLEDGE_LIMIT - used_bonus))
+                    if bonus_points:
+                        await c.execute(
+                            "INSERT INTO golden_hour_players(hour,uid,name,bonus_knowledge) VALUES (?,?,?,?) "
+                            "ON CONFLICT(hour,uid) DO UPDATE SET name=excluded.name,bonus_knowledge=golden_hour_players.bonus_knowledge+excluded.bonus_knowledge",
+                            (golden["id"], uid, name, bonus_points),
+                        )
+                total_points = points + bonus_points
                 await c.execute(
                     "UPDATE school_players SET knowledge=knowledge+? WHERE season=? AND uid=?",
-                    (points, sid, uid),
+                    (total_points, sid, uid),
                 )
                 p = await self.one(
                     c,
@@ -2294,7 +2410,8 @@ class SchoolEvent:
                                 f"🏁 {name} первым достиг 50-го уровня!\n🏆 Отдельный NFT ждёт выдачи администратором. Остальные участники продолжают призовой путь.",
                             ),
                         )
-                return f"✅ +{dc:,} DC и +{points} 📖"
+                golden_text = f" (⚡ Золотой час: +{bonus_points} 📖)" if bonus_points else ""
+                return f"✅ +{dc:,} DC и +{total_points} 📖" + golden_text
             if category == "day":
                 if value != day:
                     return "Бонус относится к другому дню."
@@ -3758,6 +3875,21 @@ async def mini_event_task(bot: Bot) -> None:
         logger.exception("Mini event task failed")
 
 
+async def golden_hour_task(bot: Bot) -> None:
+    for hour, top in await school_event.finish_golden_hours():
+        lines = ["🏁 Золотой час завершён!", "", "Лимиты бонусов сброшены для следующего запуска."]
+        if top:
+            lines.extend(["", "🏆 Топ Золотого часа:"])
+            lines.extend(
+                f"{place}. {player['name']} — ⚔️ +{player['bonus_damage']:,} урона · 🎮 {player['games']}/{GOLDEN_HOUR_GAMES_LIMIT} игр"
+                for place, player in enumerate(top, 1)
+            )
+        try:
+            await bot.send_message(REQUIRED_CHANNEL, "\n".join(lines).replace(",", " "))
+        except Exception:
+            logger.exception("Could not publish Golden Hour result")
+
+
 PLAIN_COMMANDS = {
     "start",
     "help",
@@ -3813,6 +3945,7 @@ PLAIN_COMMANDS = {
     "admin",
     "bossdamage",
     "eventdays",
+    "goldenhour",
     "broadcast",
     "supportgrant",
     "supportrevoke",
@@ -3861,6 +3994,7 @@ RUSSIAN_COMMANDS = {
     "уронбоссу": "bossdamage",
     "ударитьбосса": "bossdamage",
     "дниивента": "eventdays",
+    "золотойчас": "goldenhour",
     "раздать": "broadcast",
     "датьдоступ": "supportgrant",
     "убратьдоступ": "supportrevoke",
@@ -4987,6 +5121,63 @@ async def cmd_eventdays(message: Message) -> None:
     await message.answer(
         f"✅ Срок ивента изменён на {days:+d} дн.\n📅 Завершение: {deadline} (Ташкент)\n{duration}"
     )
+
+
+@router.message(Command("goldenhour"), F.chat.type == "private")
+async def cmd_goldenhour(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    action = parts[1].lower() if len(parts) > 1 else ""
+    usage = "Золотой час:\nзолотойчас старт\nзолотойчас статус\nзолотойчас стоп"
+    if action in {"старт", "start"}:
+        status, hour = await school_event.start_golden_hour()
+        if status == "no_event":
+            await message.answer("❌ Нельзя запустить Золотой час: активного ивента нет.")
+            return
+        if status == "active":
+            remaining = max(0, int(hour["ends"] - time.time()))
+            await message.answer(f"⚡ Золотой час уже идёт. Осталось {remaining // 60} мин.")
+            return
+        text = (
+            "⚡ ЗОЛОТОЙ ЧАС НАЧАЛСЯ!\n\n"
+            "⏳ Длительность: 60 минут\n"
+            "⚔️ Проигранные ставки наносят x2 урон боссу\n"
+            "📚 Награды за квесты дают x2 очков знаний\n\n"
+            "Лимиты на игрока:\n"
+            f"• до {GOLDEN_HOUR_DAMAGE_LIMIT:,} бонусного урона\n"
+            f"• до {GOLDEN_HOUR_KNOWLEDGE_LIMIT} дополнительных 📖\n"
+            f"• до {GOLDEN_HOUR_GAMES_LIMIT} игр в рейтинге\n\n"
+            "После завершения все лимиты сбросятся."
+        ).replace(",", " ")
+        try:
+            await bot.send_message(REQUIRED_CHANNEL, text)
+        except Exception:
+            logger.exception("Could not publish Golden Hour start")
+            await message.answer("❌ Не удалось опубликовать Золотой час в канале.")
+            return
+        await message.answer("✅ Золотой час запущен на 60 минут.")
+        return
+    if action in {"статус", "status"}:
+        hour = await school_event.golden_hour_status()
+        if not hour:
+            await message.answer("ℹ️ Сейчас Золотой час не активен.")
+            return
+        remaining = max(0, int(hour["ends"] - time.time()))
+        await message.answer(
+            f"⚡ Золотой час активен.\n⏳ Осталось: {remaining // 60} мин. {remaining % 60} сек.\n"
+            f"⚔️ Лимит бонусного урона: {GOLDEN_HOUR_DAMAGE_LIMIT:,} DC\n"
+            f"📚 Лимит знаний: {GOLDEN_HOUR_KNOWLEDGE_LIMIT} 📖".replace(",", " ")
+        )
+        return
+    if action in {"стоп", "stop"}:
+        if not await school_event.stop_golden_hour():
+            await message.answer("ℹ️ Активного Золотого часа нет.")
+            return
+        await golden_hour_task(bot)
+        await message.answer("✅ Золотой час завершён. Итоги опубликованы в канале.")
+        return
+    await message.answer(usage)
 
 
 @router.message(Command("bossdamage"), F.chat.type == "private")
@@ -6453,7 +6644,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     if s1 == s2 == s3:
         win = bet * 2
         await db.add_coins(user_id, win)
-        await school_game(message.from_user, f"game:{action_key.get()}", bet, True)
+        await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎰 {s1} {s2} {s3}\n\n✅ Ты выиграл!\n💸 Ставка: {bet} DC\n🏆 Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC"
@@ -6463,7 +6654,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
             f"🎰 Слоты\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC",
         )
     else:
-        boss_note = await school_game(message.from_user, f"game:{action_key.get()}", bet, False)
+        boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         balance_after = await db.get_display_balance(user_id)
         await message.reply(
             f"🎰 {s1} {s2} {s3}\n\n❌ Не повезло!\n💸 Ставка: {bet} DC\n🪙 Баланс: {balance_after} DC{boss_note}"
@@ -6521,7 +6712,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     if result_color == color:
         win = bet * 2
         await db.add_coins(user_id, win)
-        await school_game(message.from_user, f"game:{action_key.get()}", bet, True)
+        await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎡 Выпало: {result_emoji}\n\n✅ Ты выиграл!\n💸 Ставка: {bet} DC на {chosen_emoji}\n🏆 Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC"
@@ -6531,7 +6722,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
             f"🎡 Рулетка\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {chosen_emoji}\nВыпало: {result_emoji}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC",
         )
     else:
-        boss_note = await school_game(message.from_user, f"game:{action_key.get()}", bet, False)
+        boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎡 Выпало: {result_emoji}\n\n❌ Не повезло!\n💸 Ставка: {bet} DC на {chosen_emoji}\n🪙 Баланс: {new_balance} DC{boss_note}"
@@ -6586,7 +6777,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
     if rolled == number:
         win = bet * 2
         await db.add_coins(user_id, win)
-        await school_game(message.from_user, f"game:{action_key.get()}", bet, True)
+        await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎲 Выпало: {rolled}\n\n✅ Угадал!\n💸 Ставка: {bet} DC на {number}\n🏆 Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC"
@@ -6596,7 +6787,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
             f"🎲 Кубик\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {number}\nВыпало: {rolled}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC",
         )
     else:
-        boss_note = await school_game(message.from_user, f"game:{action_key.get()}", bet, False)
+        boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
             f"🎲 Выпало: {rolled}\n\n❌ Не угадал! (ты выбрал {number})\n💸 Ставка: {bet} DC\n🪙 Баланс: {new_balance} DC{boss_note}"
@@ -6661,14 +6852,14 @@ async def cmd_coinflip(message: Message, bot: Bot) -> None:
     if result == side:
         prize = bet * 2
         await db.add_coins(user_id, prize)
-        await school_game(message.from_user, f"coinflip:{action_key.get()}", bet, True)
+        await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, True)
         balance_after = await db.get_display_balance(user_id)
         text = f"🪙 Выпало: {result_text}\n\n✅ Ты выиграл!\n💸 Ставка: {bet:,} DC на {chosen_text}\n🏆 Выигрыш: {prize:,} DC\n🪙 Баланс: {balance_after:,} DC".replace(
             ",", " "
         )
         log_result = f"✅ Выигрыш: {prize} DC"
     else:
-        boss_note = await school_game(message.from_user, f"coinflip:{action_key.get()}", bet, False)
+        boss_note = await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, False)
         balance_after = await db.get_display_balance(user_id)
         text = f"🪙 Выпало: {result_text}\n\n❌ Ты проиграл.\n💸 Ставка: {bet:,} DC на {chosen_text}\n🪙 Баланс: {balance_after:,} DC{boss_note}".replace(
             ",", " "
@@ -7548,6 +7739,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "admin",
     "bossdamage",
     "eventdays",
+    "goldenhour",
     "broadcast",
     "supportgrant",
     "supportrevoke",
@@ -7578,6 +7770,7 @@ BOT_ARGUMENT_COMMANDS = {
     "coinflip",
     "lottery",
     "admin",
+    "goldenhour",
     "supportgrant",
     "supportrevoke",
     "supportreply",
@@ -7638,6 +7831,7 @@ PLAIN_COMMAND_HANDLERS = {
     "admin": cmd_admin,
     "bossdamage": cmd_bossdamage,
     "eventdays": cmd_eventdays,
+    "goldenhour": cmd_goldenhour,
     "broadcast": cmd_broadcast,
     "supportgrant": cmd_supportgrant,
     "supportrevoke": cmd_supportrevoke,
@@ -8119,6 +8313,7 @@ async def main():
             (school_notifications, 5),
             (bonus_notification_worker, 2),
             (mini_event_task, 5),
+            (golden_hour_task, 15),
             (jackpot_draw_task, 30),
             (daily_reset_task, 3600),
         ):
