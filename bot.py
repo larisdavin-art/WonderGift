@@ -398,6 +398,7 @@ MAGISTER_SEAL_COUNT = 3
 LOSS_SHARE_MIN_AMOUNT = 10000
 GOLDEN_HOUR_SECONDS = 3600
 GOLDEN_HOUR_DAMAGE_LIMIT = 100000
+GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT = 100000
 GOLDEN_HOUR_KNOWLEDGE_LIMIT = 500
 GOLDEN_HOUR_GAMES_LIMIT = 20
 MINES_GRID_SIZE = 25
@@ -1908,7 +1909,7 @@ class SchoolEvent:
                 "CREATE TABLE IF NOT EXISTS school_actions (season INTEGER, uid INTEGER, token TEXT, PRIMARY KEY(season,uid,token))",
                 "CREATE TABLE IF NOT EXISTS school_prizes (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, uid INTEGER, reason TEXT, kind TEXT, amount INTEGER, done INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, UNIQUE(season,uid,reason,kind))",
                 "CREATE TABLE IF NOT EXISTS school_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER, tag TEXT, text TEXT, sent INTEGER DEFAULT 0, UNIQUE(season,tag))",
-                "CREATE TABLE IF NOT EXISTS golden_hours (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER NOT NULL, started REAL NOT NULL, ends REAL NOT NULL, finished REAL)",
+                "CREATE TABLE IF NOT EXISTS golden_hours (id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER NOT NULL, started REAL NOT NULL, ends REAL NOT NULL, finished REAL, bonus_damage INTEGER NOT NULL DEFAULT 0)",
                 "CREATE TABLE IF NOT EXISTS golden_hour_players (hour INTEGER NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, bonus_damage INTEGER NOT NULL DEFAULT 0, bonus_knowledge INTEGER NOT NULL DEFAULT 0, games INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(hour,uid))",
             ):
                 await c.execute(sql)
@@ -1922,6 +1923,13 @@ class SchoolEvent:
                 await c.execute("ALTER TABLE school_seasons ADD COLUMN boss_stage INTEGER DEFAULT 1")
             if "seal_stage" not in season_columns:
                 await c.execute("ALTER TABLE school_seasons ADD COLUMN seal_stage INTEGER DEFAULT 0")
+            async with c.execute("PRAGMA table_info(golden_hours)") as cur:
+                golden_hour_columns = {row[1] for row in await cur.fetchall()}
+            if "bonus_damage" not in golden_hour_columns:
+                await c.execute("ALTER TABLE golden_hours ADD COLUMN bonus_damage INTEGER NOT NULL DEFAULT 0")
+            await c.execute(
+                "UPDATE golden_hours SET bonus_damage=COALESCE((SELECT SUM(p.bonus_damage) FROM golden_hour_players p WHERE p.hour=golden_hours.id),0) WHERE bonus_damage=0"
+            )
             async with c.execute(
                 "SELECT id FROM school_seasons WHERE boss_stage=1 AND hp<=0 AND killed IS NOT NULL AND stopped=0 AND ends>?",
                 (time.time(),),
@@ -2169,10 +2177,15 @@ class SchoolEvent:
                     extra_damage = min(
                         base_damage,
                         max(0, GOLDEN_HOUR_DAMAGE_LIMIT - used_bonus),
+                        max(0, GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT - int(golden["bonus_damage"] or 0)),
                         max(0, damage_limit - base_damage),
                     )
                     if extra_damage:
                         damage += extra_damage
+                        await c.execute(
+                            "UPDATE golden_hours SET bonus_damage=bonus_damage+? WHERE id=?",
+                            (extra_damage, golden["id"]),
+                        )
                         await c.execute(
                             "INSERT INTO golden_hour_players(hour,uid,name,bonus_damage) VALUES (?,?,?,?) "
                             "ON CONFLICT(hour,uid) DO UPDATE SET name=excluded.name,bonus_damage=golden_hour_players.bonus_damage+excluded.bonus_damage",
@@ -5144,8 +5157,8 @@ async def cmd_goldenhour(message: Message, bot: Bot) -> None:
             "⏳ Длительность: 60 минут\n"
             "⚔️ Проигранные ставки наносят x2 урон боссу\n"
             "📚 Награды за квесты дают x2 очков знаний\n\n"
-            "Лимиты на игрока:\n"
-            f"• до {GOLDEN_HOUR_DAMAGE_LIMIT:,} бонусного урона\n"
+            "Лимиты:\n"
+            f"• до {GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT:,} общего бонусного урона по боссу\n"
             f"• до {GOLDEN_HOUR_KNOWLEDGE_LIMIT} дополнительных 📖\n"
             f"• до {GOLDEN_HOUR_GAMES_LIMIT} игр в рейтинге\n\n"
             "После завершения все лимиты сбросятся."
@@ -5166,7 +5179,7 @@ async def cmd_goldenhour(message: Message, bot: Bot) -> None:
         remaining = max(0, int(hour["ends"] - time.time()))
         await message.answer(
             f"⚡ Золотой час активен.\n⏳ Осталось: {remaining // 60} мин. {remaining % 60} сек.\n"
-            f"⚔️ Лимит бонусного урона: {GOLDEN_HOUR_DAMAGE_LIMIT:,} DC\n"
+            f"⚔️ Бонусный урон: {hour['bonus_damage']:,} / {GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT:,} DC\n"
             f"📚 Лимит знаний: {GOLDEN_HOUR_KNOWLEDGE_LIMIT} 📖".replace(",", " ")
         )
         return
