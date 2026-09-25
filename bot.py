@@ -145,7 +145,7 @@ SCRATCH_WIN_CHANCE = 0.05
 SCRATCH_MULTIPLIER = 3
 LOTTERY_MULTIPLIERS = [3.0] + [2.0] + [1.5] + [1.0] + [0.5] * 2 + [0.0] * 19
 SLOT_SYMBOLS = ("🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🍉", "🔔", "🍀", "🔷", "🎲", "🎯")
-ROULETTE_WHEEL = ("red",) * 10 + ("black",) * 10 + ("green",) * 17
+ROULETTE_WHEEL = ("red",) * 3 + ("black",) * 3 + ("green",) * 4
 PANDORA_COOLDOWN = 5 * 86400
 PANDORA_REWARDS = (
     ("coins", 1000, 22),
@@ -4117,6 +4117,10 @@ def parse_plain_command(text: str | None):
             "чёрное": "black",
             "черный": "black",
             "чёрный": "black",
+            "зеленое": "green",
+            "зелёное": "green",
+            "зеленый": "green",
+            "зелёный": "green",
         }
         parts[1] = colors.get(parts[1].lower(), parts[1])
     if command == "coinflip" and len(parts) > 1:
@@ -4342,7 +4346,7 @@ async def cmd_supportclose(message: Message, bot: Bot) -> None:
 
 async def send_help(message: Message) -> None:
     await message.answer(
-        "📖 Как играть\n\n1️⃣ Подпишись на канал и нажми «Проверить подписку».\n2️⃣ Пиши сообщения в основной группе — за них начисляются DC.\n3️⃣ Забирай ежедневный бонус в личке или основной группе: бонус.\n\n🎰 Игры — только в личке с ботом\nНажми «🎮 Игры» в главном меню и выбери игру и ставку кнопками.\n• слоты 50\n• рулетка красное 50\n• кубик 3 50\n• монетка орёл 50\n• лотерея 1000\n• мины 2500\n• скретч 1000\nВ минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n⚔️ Дуэли — в основном чате и привязанном чате канала\n• дуэль 1000 — создать вызов на 1 000 DC\n• дуэль 1000 @username — вызвать конкретного игрока\nТакже можно ответить «дуэль 1000» на сообщение соперника.\nСоперник принимает дуэль кнопкой, победитель получает весь банк.\n\n💱 Полезное\n• баланс — твои DC\n• обмен — обмен DC на шанс, подарки или Premium\n• промо КОД — активировать промокод\n• перевод @username сумма — отправить DC игроку\n• стата — статистика в основном чате\n\nКоманды пишутся без /"
+        "📖 Как играть\n\n1️⃣ Подпишись на канал и нажми «Проверить подписку».\n2️⃣ Пиши сообщения в основной группе — за них начисляются DC.\n3️⃣ Забирай ежедневный бонус в личке или основной группе: бонус.\n\n🎰 Игры — только в личке с ботом\nНажми «🎮 Игры» в главном меню и выбери игру и ставку кнопками.\n• слоты 50\n• рулетка красное 50\n• рулетка зелёное 50 — выплата ×2\n• кубик 3 50\n• монетка орёл 50\n• лотерея 1000\n• мины 2500\n• скретч 1000\nВ минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n⚔️ Дуэли — в основном чате и привязанном чате канала\n• дуэль 1000 — создать вызов на 1 000 DC\n• дуэль 1000 @username — вызвать конкретного игрока\nТакже можно ответить «дуэль 1000» на сообщение соперника.\nСоперник принимает дуэль кнопкой, победитель получает весь банк.\n\n💱 Полезное\n• баланс — твои DC\n• обмен — обмен DC на шанс, подарки или Premium\n• промо КОД — активировать промокод\n• перевод @username сумма — отправить DC игроку\n• стата — статистика в основном чате\n\nКоманды пишутся без /"
     )
 
 
@@ -6518,7 +6522,7 @@ async def ask_game_bet(callback: CallbackQuery, game: str, option: str = "-") ->
     }
     details = ""
     if game == "roulette":
-        details = "\nЦвет: " + ("🔴 красное" if option == "red" else "⚫ чёрное")
+        details = "\nЦвет: " + {"red": "🔴 красное", "black": "⚫ чёрное", "green": "🟢 зелёное ×2"}.get(option, "")
     elif game == "dice":
         details = f"\nВыбранное число: {option}"
     elif game == "coinflip":
@@ -6543,7 +6547,7 @@ async def game_options_menu(callback: CallbackQuery) -> None:
     option = parts[2] if len(parts) > 2 else None
     if game in {"slots", "mines", "scratch", "lottery"}:
         await ask_game_bet(callback, game)
-    elif game == "roulette" and option in {"red", "black"}:
+    elif game == "roulette" and option in {"red", "black", "green"}:
         await ask_game_bet(callback, game, option)
     elif game == "roulette":
         await callback.message.edit_text(
@@ -6554,6 +6558,7 @@ async def game_options_menu(callback: CallbackQuery) -> None:
                         InlineKeyboardButton(text="🔴 Красное", callback_data="game:roulette:red"),
                         InlineKeyboardButton(text="⚫ Чёрное", callback_data="game:roulette:black"),
                     ],
+                    [InlineKeyboardButton(text="🟢 Зелёное ×2", callback_data="game:roulette:green")],
                     [InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")],
                 ]
             ),
@@ -6673,7 +6678,7 @@ async def inline_game_bet(callback: CallbackQuery, bot: Bot) -> None:
     if bet not in GAME_BET_PRESETS:
         await callback.answer("Этой ставки нет в меню.", show_alert=True)
         return
-    if game == "roulette" and option not in {"red", "black"}:
+    if game == "roulette" and option not in {"red", "black", "green"}:
         await callback.answer("Сначала выбери цвет.", show_alert=True)
         return
     if game == "dice" and option not in {"1", "2", "3", "4", "5", "6"}:
@@ -6774,11 +6779,11 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         return
     args = message.text.split()
     if len(args) < 3:
-        await message.reply("Использование: /roulette [red/black] [ставка]\nПример: /roulette red 50")
+        await message.reply("Использование: /roulette [red/black/green] [ставка]\nПример: /roulette green 50")
         return
     color = args[1].lower()
-    if color not in ("red", "black"):
-        await message.reply("❌ Выбери цвет: red или black\nПример: /roulette red 50")
+    if color not in ("red", "black", "green"):
+        await message.reply("❌ Выбери цвет: red, black или green\nПример: /roulette green 50")
         return
     try:
         bet = int(args[2])
@@ -6801,10 +6806,11 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         balance, _ = await db.get_coins(user_id)
         await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
         return
+    chosen_emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[color]
     result_color = random.choice(ROULETTE_WHEEL)
+    shown_color = result_color
     emoji_map = {"red": "🔴", "black": "⚫", "green": "🟢"}
-    result_emoji = emoji_map[result_color]
-    chosen_emoji = "🔴" if color == "red" else "⚫"
+    result_emoji = emoji_map[shown_color]
     if result_color == color:
         win = bet * 2
         await db.add_coins(user_id, win)
