@@ -395,6 +395,11 @@ SCHOOL_BOSSES = {
 }
 MAGISTER_SEAL_HP = 3000000
 MAGISTER_SEAL_COUNT = 3
+MAGISTER_REGEN_AMOUNT = 500000
+MAGISTER_REGEN_INTERVAL = 6 * 3600
+MAGISTER_SHIELD_SECONDS = 3600
+MAGISTER_REGEN_DAILY_LIMIT = 3
+MAGISTER_REGEN_MIN_HP = 500000
 LOSS_SHARE_MIN_AMOUNT = 10000
 GOLDEN_HOUR_SECONDS = 3600
 GOLDEN_HOUR_DAMAGE_LIMIT = 100000
@@ -1901,7 +1906,7 @@ class SchoolEvent:
     async def init(self):
         async with self.transaction() as c:
             for sql in (
-                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER, boss_stage INTEGER DEFAULT 1, seal_stage INTEGER DEFAULT 0)",
+                "CREATE TABLE IF NOT EXISTS school_seasons (id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, ends REAL, stopped INTEGER DEFAULT 0, hp INTEGER, max_hp INTEGER, killed REAL, path_winner INTEGER, boss_stage INTEGER DEFAULT 1, seal_stage INTEGER DEFAULT 0, shield_until REAL DEFAULT 0, last_regen REAL DEFAULT 0, regen_day TEXT, regen_uses INTEGER DEFAULT 0)",
                 "CREATE TABLE IF NOT EXISTS school_players (season INTEGER, uid INTEGER, name TEXT, knowledge INTEGER DEFAULT 0, damage INTEGER DEFAULT 0, reached REAL DEFAULT 0, last_message REAL DEFAULT 0, PRIMARY KEY(season,uid))",
                 "CREATE TABLE IF NOT EXISTS school_quests (season INTEGER, uid INTEGER, day TEXT, quest TEXT, progress INTEGER DEFAULT 0, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day,quest))",
                 "CREATE TABLE IF NOT EXISTS school_days (season INTEGER, uid INTEGER, day TEXT, streak INTEGER, claimed INTEGER DEFAULT 0, PRIMARY KEY(season,uid,day))",
@@ -1923,6 +1928,14 @@ class SchoolEvent:
                 await c.execute("ALTER TABLE school_seasons ADD COLUMN boss_stage INTEGER DEFAULT 1")
             if "seal_stage" not in season_columns:
                 await c.execute("ALTER TABLE school_seasons ADD COLUMN seal_stage INTEGER DEFAULT 0")
+            for column, definition in (
+                ("shield_until", "REAL DEFAULT 0"),
+                ("last_regen", "REAL DEFAULT 0"),
+                ("regen_day", "TEXT"),
+                ("regen_uses", "INTEGER DEFAULT 0"),
+            ):
+                if column not in season_columns:
+                    await c.execute(f"ALTER TABLE school_seasons ADD COLUMN {column} {definition}")
             async with c.execute("PRAGMA table_info(golden_hours)") as cur:
                 golden_hour_columns = {row[1] for row in await cur.fetchall()}
             if "bonus_damage" not in golden_hour_columns:
@@ -2011,6 +2024,49 @@ class SchoolEvent:
                 await c.execute("UPDATE golden_hours SET finished=? WHERE id=?", (now, hour["id"]))
                 outcomes.append((hour, top))
         return outcomes
+
+    async def activate_magister_regeneration(self, now=None, initial=False):
+        """Запускает лечение Магистра и часовую неуязвимость, если пришло время."""
+        now = time.time() if now is None else now
+        day = datetime.fromtimestamp(now, pytz.timezone("Europe/Moscow")).date().isoformat()
+        async with self.transaction() as c:
+            season = await self.current(c, now)
+            if not season or int(season["boss_stage"] or 1) != 2 or int(season["hp"] or 0) < MAGISTER_REGEN_MIN_HP:
+                return None
+            shield_until = float(season["shield_until"] or 0)
+            last_regen = float(season["last_regen"] or 0)
+            uses = int(season["regen_uses"] or 0) if season["regen_day"] == day else 0
+            if shield_until > now or uses >= MAGISTER_REGEN_DAILY_LIMIT:
+                return None
+            if initial:
+                if last_regen > 0:
+                    return None
+            elif (now - last_regen) < MAGISTER_REGEN_INTERVAL:
+                return None
+            healed = min(MAGISTER_REGEN_AMOUNT, max(0, int(season["max_hp"]) - int(season["hp"])))
+            if healed <= 0:
+                return None
+            new_hp = int(season["hp"]) + healed
+            new_shield_until = now + MAGISTER_SHIELD_SECONDS
+            await c.execute(
+                "UPDATE school_seasons SET hp=?,shield_until=?,last_regen=?,regen_day=?,regen_uses=? WHERE id=?",
+                (new_hp, new_shield_until, now, day, uses + 1, season["id"]),
+            )
+            return {
+                "healed": healed,
+                "hp": new_hp,
+                "max_hp": int(season["max_hp"]),
+                "shield_until": new_shield_until,
+                "uses": uses + 1,
+            }
+
+    async def magister_shield_remaining(self, now=None):
+        now = time.time() if now is None else now
+        async with self.transaction() as c:
+            season = await self.current(c, now)
+            if not season or int(season["boss_stage"] or 1) != 2:
+                return 0
+            return max(0, int(float(season["shield_until"] or 0) - now))
 
     async def start(self):
         async with self.transaction() as c:
@@ -2160,6 +2216,8 @@ class SchoolEvent:
             phase_reborn = False
             if loss > 0 and season["hp"] > 0:
                 stage = int(season["boss_stage"] or 1)
+                if (not manual) and stage == 2 and float(season["shield_until"] or 0) > now:
+                    return (0, 0)
                 seals = int(season["seal_stage"] or 0)
                 damage_limit = int(season["hp"])
                 if stage == 2 and seals == 0 and (season["hp"] > MAGISTER_SEAL_HP):
@@ -3492,6 +3550,9 @@ async def event_page(uid, name, page):
                 seals_removed = int(season["seal_stage"] or 0)
                 if stage == 2 and seals_removed:
                     text += f"\n🔮 Снято печатей: {seals_removed} / {MAGISTER_SEAL_COUNT}"
+                shield_seconds = max(0, int(float(season["shield_until"] or 0) - now))
+                if stage == 2 and shield_seconds:
+                    text += f"\n🛡 Печать Забвения: ещё {(shield_seconds + 59) // 60} мин. Урон не проходит."
                 text += "\n\nПроигранные ставки наносят урон. Дуэли не учитываются. Очки знаний идут только в призовой путь."
                 if stage == 1:
                     text += "\nЗа победу: от 10 000 урона — 10 000 DC; от 100 000 — также ключ Отличника. Последний удар: 50 000 DC. После победы появится Магистр Забвений."
@@ -3773,6 +3834,7 @@ async def bonus_notification_worker(bot: Bot) -> None:
 
 
 async def school_game(user, token, bet, won):
+    shield_seconds = await school_event.magister_shield_remaining()
     damage, refund = await school_event.record(
         user.id,
         display_name(user),
@@ -3782,6 +3844,8 @@ async def school_game(user, token, bet, won):
     )
     if not won:
         await jackpot_loss(user, max(0, bet - refund), f"{token}:jackpot")
+    if (not won) and shield_seconds:
+        return f"\n🛡 Печать Забвения активна ещё {(shield_seconds + 59) // 60} мин. Урон не проходит."
     return f"\n📚 Урон боссу: {damage:,}. Возвращено: {refund:,} DC" if damage else ""
 
 
@@ -3901,6 +3965,25 @@ async def golden_hour_task(bot: Bot) -> None:
             await bot.send_message(REQUIRED_CHANNEL, "\n".join(lines).replace(",", " "))
         except Exception:
             logger.exception("Could not publish Golden Hour result")
+
+
+def magister_regeneration_text(event: dict) -> str:
+    return (
+        "🔮 ПЕЧАТЬ ЗАБВЕНИЯ АКТИВИРОВАНА\n\n"
+        f"Магистр Забвений восстановил {event['healed']:,} HP.\n"
+        f"❤️ {event['hp']:,} / {event['max_hp']:,} HP\n\n"
+        "🛡 Босс неуязвим 1 час — урон от игр временно не засчитывается."
+    ).replace(",", " ")
+
+
+async def magister_regeneration_task(bot: Bot) -> None:
+    event = await school_event.activate_magister_regeneration()
+    if not event:
+        return
+    try:
+        await bot.send_message(REQUIRED_CHANNEL, magister_regeneration_text(event))
+    except Exception:
+        logger.exception("Could not publish Magister regeneration")
 
 
 PLAIN_COMMANDS = {
@@ -8300,6 +8383,7 @@ async def main():
     await db.init()
     await school_event.init()
     await load_runtime_settings()
+    initial_magister_regeneration = await school_event.activate_magister_regeneration(initial=True)
     bot = Bot(TOKEN, session=AiohttpSession(timeout=10))
     bot.session.middleware(TelegramTransport())
     dp = Dispatcher(disable_fsm=True)
@@ -8316,6 +8400,13 @@ async def main():
             logging.warning("Активен webhook %s; отключаю его для polling.", info.url)
             await bot.delete_webhook(drop_pending_updates=False)
         await resolve_channel_chat(bot)
+        if initial_magister_regeneration:
+            try:
+                await bot.send_message(
+                    REQUIRED_CHANNEL, magister_regeneration_text(initial_magister_regeneration)
+                )
+            except Exception:
+                logger.exception("Could not publish initial Magister regeneration")
         background = [
             asyncio.create_task(gift_worker(bot, db.path), name="gifts"),
             asyncio.create_task(notice_worker(bot, db.path), name="notices"),
@@ -8327,6 +8418,7 @@ async def main():
             (bonus_notification_worker, 2),
             (mini_event_task, 5),
             (golden_hour_task, 15),
+            (magister_regeneration_task, 30),
             (jackpot_draw_task, 30),
             (daily_reset_task, 3600),
         ):
