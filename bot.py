@@ -141,11 +141,11 @@ JACKPOT_PERCENT = 2
 JACKPOT_TICKET_STEP = 5000
 JACKPOT_TICKET_LIMIT = 20
 SCRATCH_SYMBOLS = ("🌈", "🔥", "🍓", "🍒", "🍋", "💎")
-SCRATCH_WIN_CHANCE = 0.05
+SCRATCH_WIN_CHANCE = 0.20
 SCRATCH_MULTIPLIER = 3
-LOTTERY_MULTIPLIERS = [3.0] + [2.0] + [1.5] + [1.0] + [0.5] * 2 + [0.0] * 19
-SLOT_SYMBOLS = ("🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🍉", "🔔", "🍀", "🔷", "🎲", "🎯")
-ROULETTE_WHEEL = ("red",) * 3 + ("black",) * 3 + ("green",) * 4
+LOTTERY_MULTIPLIERS = [3.0] + [2.5] + [2.0] * 2 + [1.5] * 4 + [1.0] * 2 + [0.5] * 2 + [0.0] * 13
+SLOT_SYMBOLS = ("🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🍉", "🔔")
+ROULETTE_WHEEL = ("red",) * 16 + ("black",) * 16 + ("green",) * 5
 PANDORA_COOLDOWN = 5 * 86400
 PANDORA_REWARDS = (
     ("coins", 1000, 22),
@@ -393,6 +393,8 @@ SCHOOL_BOSSES = {
         "top_text": "🥇 NFT · 🥈 NFT · 🥉 NFT",
     },
 }
+# Школьный ивент завершён. Данные сохраняются в БД, но игровой функционал отключён.
+SCHOOL_EVENT_ENABLED = False
 MAGISTER_SEAL_HP = 3000000
 MAGISTER_SEAL_COUNT = 3
 MAGISTER_REGEN_AMOUNT = 500000
@@ -407,7 +409,7 @@ GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT = 100000
 GOLDEN_HOUR_KNOWLEDGE_LIMIT = 500
 GOLDEN_HOUR_GAMES_LIMIT = 20
 MINES_GRID_SIZE = 25
-MINES_COUNT = 12
+MINES_COUNT = 8
 MAX_BET = 1000000000
 
 
@@ -2190,6 +2192,8 @@ class SchoolEvent:
             )
 
     async def record(self, uid, name, token, metrics=None, loss=0, now=None, manual=False):
+        if not SCHOOL_EVENT_ENABLED:
+            return (0, 0)
         now = time.time() if now is None else now
         async with self.transaction() as c:
             season = await self.current(c, now)
@@ -2710,11 +2714,6 @@ def lottery_text(game: dict) -> str:
 
 def start_keyboard(is_admin: bool = False, support_access: bool = False):
     buttons = [
-        [InlineKeyboardButton(text="🏫 Школьный ивент", callback_data="school:boss")],
-        [
-            InlineKeyboardButton(text="⭐ Квесты", callback_data="school:quests"),
-            InlineKeyboardButton(text="📖 Призовой путь", callback_data="school:path:0"),
-        ],
         [InlineKeyboardButton(text="🎮 Игры", callback_data="games")],
         [InlineKeyboardButton(text="🏆 Джекпот дня", callback_data="jackpot:view")],
         [InlineKeyboardButton(text="📦 Кейсы", callback_data="cases")],
@@ -2802,19 +2801,6 @@ def cases_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🎁 ЯЩИК ПАНДОРЫ — бесплатно раз в 5 дней",
                     callback_data="pandora_view",
-                )
-            ],
-            [InlineKeyboardButton(text="🎒 ШКОЛЬНЫЙ — 3 000 DC", callback_data="case_view_school")],
-            [
-                InlineKeyboardButton(
-                    text="🎓 СТУДЕНЧЕСКИЙ — 12 000 DC",
-                    callback_data="case_view_student",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 КЕЙС ОТЛИЧНИКА — только 🔑",
-                    callback_data="case_view_excellent",
                 )
             ],
             [InlineKeyboardButton(text="🩸 BLOOD — 5 000 DC", callback_data="case_view_blood")],
@@ -3568,6 +3554,8 @@ async def event_page(uid, name, page):
 
 @router.message(F.text.regexp("(?i)^/?(ивент|квесты|путь|event|quests|path)(?:@\\w+)?$"))
 async def school_command(message: Message):
+    if not SCHOOL_EVENT_ENABLED:
+        return
     if not message.from_user or message.sender_chat or message.from_user.is_bot:
         return
     if message.chat.type != "private" and message.chat.id != MAIN_CHAT_ID:
@@ -3622,6 +3610,9 @@ async def deliver_school_gifts(bot: Bot, sid: int, uid: int) -> tuple[int, int]:
 
 @router.callback_query(F.data.startswith("school:"))
 async def school_callback(callback: CallbackQuery):
+    if not SCHOOL_EVENT_ENABLED:
+        await callback.answer("Школьный ивент завершён.", show_alert=True)
+        return
     if await db.is_banned(callback.from_user.id):
         await callback.answer(BAN_MESSAGE, show_alert=True)
         return
@@ -3636,6 +3627,9 @@ async def school_callback(callback: CallbackQuery):
     | F.data.startswith("scla:")
 )
 async def school_claim_callback(callback: CallbackQuery, bot: Bot):
+    if not SCHOOL_EVENT_ENABLED:
+        await callback.answer("Школьный ивент завершён.", show_alert=True)
+        return
     if await db.is_banned(callback.from_user.id):
         await callback.answer(BAN_MESSAGE, show_alert=True)
         return
@@ -3781,6 +3775,8 @@ async def school_admin_callback(callback: CallbackQuery):
 
 
 async def school_notifications(bot):
+    if not SCHOOL_EVENT_ENABLED:
+        return
     try:
         async with school_event.transaction() as c:
             async with c.execute("SELECT * FROM school_outbox WHERE sent=0 ORDER BY id LIMIT 5") as cur:
@@ -3834,6 +3830,8 @@ async def bonus_notification_worker(bot: Bot) -> None:
 
 
 async def school_game(user, token, bet, won):
+    if not SCHOOL_EVENT_ENABLED:
+        return ""
     shield_seconds = await school_event.magister_shield_remaining()
     damage, refund = await school_event.record(
         user.id,
@@ -3953,6 +3951,8 @@ async def mini_event_task(bot: Bot) -> None:
 
 
 async def golden_hour_task(bot: Bot) -> None:
+    if not SCHOOL_EVENT_ENABLED:
+        return
     for hour, top in await school_event.finish_golden_hours():
         lines = ["🏁 Золотой час завершён!", "", "Лимиты бонусов сброшены для следующего запуска."]
         if top:
@@ -3977,6 +3977,8 @@ def magister_regeneration_text(event: dict) -> str:
 
 
 async def magister_regeneration_task(bot: Bot) -> None:
+    if not SCHOOL_EVENT_ENABLED:
+        return
     event = await school_event.activate_magister_regeneration()
     if not event:
         return
@@ -5086,12 +5088,6 @@ async def cmd_broadcast(message: Message) -> None:
     parts = message.text.split()
     if len(parts) >= 3 and parts[1].lower() in {"кейс", "case"}:
         aliases = {
-            "школьный": "school",
-            "school": "school",
-            "студенческий": "student",
-            "student": "student",
-            "отличника": "excellent",
-            "excellent": "excellent",
             "blood": "blood",
             "блад": "blood",
             "pantera": "pantera",
@@ -5190,6 +5186,9 @@ async def cmd_admin(message: Message, bot: Bot) -> None:
 async def cmd_eventdays(message: Message) -> None:
     if message.chat.type != "private" or message.from_user.id != ADMIN_ID:
         return
+    if not SCHOOL_EVENT_ENABLED:
+        await message.answer("ℹ️ Школьный ивент завершён.")
+        return
     parts = (message.text or "").split()
     try:
         days = int(parts[1]) if len(parts) == 2 else 0
@@ -5226,6 +5225,9 @@ async def cmd_eventdays(message: Message) -> None:
 @router.message(Command("goldenhour"), F.chat.type == "private")
 async def cmd_goldenhour(message: Message, bot: Bot) -> None:
     if message.from_user.id != ADMIN_ID:
+        return
+    if not SCHOOL_EVENT_ENABLED:
+        await message.answer("ℹ️ Школьный ивент завершён.")
         return
     parts = (message.text or "").split()
     action = parts[1].lower() if len(parts) > 1 else ""
@@ -5283,6 +5285,9 @@ async def cmd_goldenhour(message: Message, bot: Bot) -> None:
 @router.message(Command("bossdamage"), F.chat.type == "private")
 async def cmd_bossdamage(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
+        return
+    if not SCHOOL_EVENT_ENABLED:
+        await message.answer("ℹ️ Школьный ивент завершён.")
         return
     parts = message.text.split()
     if len(parts) != 2:
@@ -6306,6 +6311,9 @@ async def show_case(callback: CallbackQuery, case_id: str) -> None:
 @router.callback_query(F.data.startswith("case_view_"))
 async def case_view_callback(callback: CallbackQuery) -> None:
     case_id = callback.data.removeprefix("case_view_")
+    if not SCHOOL_EVENT_ENABLED and case_id in {"school", "student", "excellent"}:
+        await callback.answer("Этот кейс был доступен только во время ивента.", show_alert=True)
+        return
     if case_id not in CASES:
         await callback.answer("Кейс не найден", show_alert=True)
         return
@@ -6413,16 +6421,25 @@ async def open_spider_man_case(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "case_open_school")
 async def open_school_case(callback: CallbackQuery, bot: Bot) -> None:
+    if not SCHOOL_EVENT_ENABLED:
+        await callback.answer("Этот кейс был доступен только во время ивента.", show_alert=True)
+        return
     await open_case(callback, bot, "school")
 
 
 @router.callback_query(F.data == "case_open_student")
 async def open_student_case(callback: CallbackQuery, bot: Bot) -> None:
+    if not SCHOOL_EVENT_ENABLED:
+        await callback.answer("Этот кейс был доступен только во время ивента.", show_alert=True)
+        return
     await open_case(callback, bot, "student")
 
 
 @router.callback_query(F.data == "case_open_excellent")
 async def open_excellent_case(callback: CallbackQuery, bot: Bot) -> None:
+    if not SCHOOL_EVENT_ENABLED:
+        await callback.answer("Этот кейс был доступен только во время ивента.", show_alert=True)
+        return
     await open_case(callback, bot, "excellent")
 
 
@@ -6522,7 +6539,7 @@ async def ask_game_bet(callback: CallbackQuery, game: str, option: str = "-") ->
     }
     details = ""
     if game == "roulette":
-        details = "\nЦвет: " + {"red": "🔴 красное", "black": "⚫ чёрное", "green": "🟢 зелёное ×2"}.get(option, "")
+        details = "\nЦвет: " + {"red": "🔴 красное", "black": "⚫ чёрное", "green": "🟢 зелёное"}.get(option, "")
     elif game == "dice":
         details = f"\nВыбранное число: {option}"
     elif game == "coinflip":
@@ -6558,7 +6575,7 @@ async def game_options_menu(callback: CallbackQuery) -> None:
                         InlineKeyboardButton(text="🔴 Красное", callback_data="game:roulette:red"),
                         InlineKeyboardButton(text="⚫ Чёрное", callback_data="game:roulette:black"),
                     ],
-                    [InlineKeyboardButton(text="🟢 Зелёное ×2", callback_data="game:roulette:green")],
+                    [InlineKeyboardButton(text="🟢 Зелёное", callback_data="game:roulette:green")],
                     [InlineKeyboardButton(text="⬅️ Все игры", callback_data="games")],
                 ]
             ),
@@ -6743,7 +6760,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     s2 = random.choice(SLOT_SYMBOLS)
     s3 = random.choice(SLOT_SYMBOLS)
     if s1 == s2 == s3:
-        win = bet * 2
+        win = bet * (3 if color == "green" else 2)
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -8389,7 +8406,11 @@ async def main():
     await db.init()
     await school_event.init()
     await load_runtime_settings()
-    initial_magister_regeneration = await school_event.activate_magister_regeneration(initial=True)
+    initial_magister_regeneration = (
+        await school_event.activate_magister_regeneration(initial=True)
+        if SCHOOL_EVENT_ENABLED
+        else None
+    )
     bot = Bot(TOKEN, session=AiohttpSession(timeout=10))
     bot.session.middleware(TelegramTransport())
     dp = Dispatcher(disable_fsm=True)
