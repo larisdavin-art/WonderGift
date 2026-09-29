@@ -301,6 +301,7 @@ ECONOMY_DEFAULTS = {
     "premium_1m": EXCHANGE_PREMIUM_1_MONTH,
 }
 ECONOMY = dict(ECONOMY_DEFAULTS)
+EXCHANGE_ENABLED = False
 BAN_MESSAGE = "🚫 Вы заблокированы и не можете участвовать в розыгрышах в боте."
 POPOLNIT_AMOUNT = 50
 GIFT_IDS = {
@@ -2790,7 +2791,7 @@ def buy_dc_keyboard() -> InlineKeyboardMarkup:
                 )
             ]
         )
-    buttons.append([InlineKeyboardButton(text="◀️ К обмену", callback_data="buy_dc_back")])
+    buttons.append([InlineKeyboardButton(text="◀️ К пакетам", callback_data="buy_dc_back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -4348,7 +4349,14 @@ async def cmd_supportclose(message: Message, bot: Bot) -> None:
 
 async def send_help(message: Message) -> None:
     await message.answer(
-        "📖 Как играть\n\n1️⃣ Подпишись на канал и нажми «Проверить подписку».\n2️⃣ Пиши сообщения в основной группе — за них начисляются DC.\n3️⃣ Забирай ежедневный бонус в личке или основной группе: бонус.\n\n🎰 Игры — только в личке с ботом\nНажми «🎮 Игры» в главном меню и выбери игру и ставку кнопками.\n• слоты 50\n• рулетка красное 50\n• рулетка зелёное 50 — выплата ×2\n• кубик 3 50\n• монетка орёл 50\n• лотерея 1000\n• мины 2500\n• скретч 1000\nВ минах открывай клетки и забирай выигрыш до того, как попадёшь на бомбу.\n\n⚔️ Дуэли — в основном чате и привязанном чате канала\n• дуэль 1000 — создать вызов на 1 000 DC\n• дуэль 1000 @username — вызвать конкретного игрока\nТакже можно ответить «дуэль 1000» на сообщение соперника.\nСоперник принимает дуэль кнопкой, победитель получает весь банк.\n\n💱 Полезное\n• баланс — твои DC\n• обмен — обмен DC на шанс, подарки или Premium\n• промо КОД — активировать промокод\n• перевод @username сумма — отправить DC игроку\n• стата — статистика в основном чате\n\nКоманды пишутся без /"
+        "📖 Кратко:\n\n"
+        "🎮 Игры — кнопка «Игры»\n"
+        "📦 Кейсы — кнопка «Кейсы»\n"
+        "🎁 бонус — ежедневный бонус\n"
+        "💰 баланс — проверить DC\n"
+        "🎟 промо КОД — активировать промокод\n"
+        "⚔️ Дуэль СУММА — вызвать игрока\n\n"
+        "Ставки и игры доступны в личке с ботом."
     )
 
 
@@ -5047,7 +5055,7 @@ async def cmd_premiumdone(message: Message, bot: Bot) -> None:
     await db.remove_premium_order(order_id)
     await message.answer(f"✅ Premium отмечен как выданный: {user_name} ({user_id}).")
     try:
-        await bot.send_message(user_id, "💎 Premium на месяц выдан. Спасибо за обмен!")
+        await bot.send_message(user_id, "💎 Premium на месяц выдан.")
     except Exception as e:
         logger.warning("Could not notify Premium recipient: %s", e)
 
@@ -5483,7 +5491,7 @@ async def admin_premiumdone_callback(callback: CallbackQuery, bot: Bot) -> None:
     _, user_id, user_name, _, _ = order
     await db.remove_premium_order(order_id)
     try:
-        await bot.send_message(user_id, "💎 Premium на месяц выдан. Спасибо за обмен!")
+        await bot.send_message(user_id, "💎 Premium на месяц выдан.")
     except Exception as e:
         logger.warning("Could not notify Premium recipient: %s", e)
     await render_admin_premium(callback, f"✅ Premium #{order_id} отмечен как выданный: {user_name}.")
@@ -5668,7 +5676,6 @@ ECONOMY_PRICE_META = {
 def admin_economy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Цены обмена", callback_data="admin_econ_exchange")],
             [InlineKeyboardButton(text="⭐ Покупка DC", callback_data="admin_econ_stars")],
             [InlineKeyboardButton(text="🎲 Шансы кейсов", callback_data="admin_econ_cases")],
             [InlineKeyboardButton(text="◀️ Админ-панель", callback_data="admin_panel")],
@@ -7395,6 +7402,7 @@ async def lottery_done(callback: CallbackQuery) -> None:
 
 @router.message(Command("exchange"))
 async def cmd_exchange(message: Message) -> None:
+    return
     if message.chat.type != "private" and message.chat.id != MAIN_CHAT_ID:
         return
     if await db.is_banned(message.from_user.id):
@@ -7418,12 +7426,9 @@ async def buy_dc_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "buy_dc_back")
 async def buy_dc_back(callback: CallbackQuery) -> None:
-    balance = await db.get_display_balance(callback.from_user.id)
     await callback.message.edit_text(
-        f"💱 Обмен D-COINS\n\n🪙 Твой баланс: {balance:,} DC\n\nВыбери что хочешь получить:".replace(
-            ",", " "
-        ),
-        reply_markup=exchange_keyboard(balance),
+        "⭐ Покупка DC за звёзды\n\nВыбери пакет:",
+        reply_markup=buy_dc_keyboard(),
     )
     await callback.answer()
 
@@ -7450,6 +7455,9 @@ async def buy_dc_package(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "exch_chance")
 async def exch_chance(callback: CallbackQuery) -> None:
+    if not EXCHANGE_ENABLED:
+        await callback.answer()
+        return
     user_id = callback.from_user.id
     cost = economy_price("chance_price")
     chance, _, _ = await db.get_user(user_id, MAIN_CHAT_ID)
@@ -7482,6 +7490,9 @@ async def exch_chance(callback: CallbackQuery) -> None:
 async def process_exchange_gift(
     callback: CallbackQuery, cost: int, gift_key: int, reward_label: str, bot: Bot
 ) -> None:
+    if not EXCHANGE_ENABLED:
+        await callback.answer()
+        return
     uid = callback.from_user.id
     gift_ids = GIFT_IDS.get(gift_key, [])
     if not gift_ids:
@@ -7521,6 +7532,9 @@ async def exch_gift_100(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "exch_premium_1m")
 async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
+    if not EXCHANGE_ENABLED:
+        await callback.answer()
+        return
     user_id = callback.from_user.id
     cost = economy_price("premium_1m")
     if await db.is_banned(user_id):
@@ -7557,7 +7571,7 @@ async def exch_premium_1m(callback: CallbackQuery, bot: Bot) -> None:
         )
         await send_log(
             bot,
-            f"💎 Обмен на Premium\n\n#{order_id} | {name} ({user_id})\n{cost:,} DC".replace(",", " "),
+            f"💎 Заявка Premium\n\n#{order_id} | {name} ({user_id})\n{cost:,} DC".replace(",", " "),
         )
     except Exception as e:
         logger.warning("Could not notify about Premium order: %s", e)
