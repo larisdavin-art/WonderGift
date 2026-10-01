@@ -8003,7 +8003,7 @@ async def plain_command_handler(message: Message, bot: Bot) -> None:
         await handler(command_message)
 
 
-@router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID)
+@router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, F.reply_to_message)
 async def support_admin_reply_handler(message: Message, bot: Bot) -> None:
     """Администратор отвечает реплаем на любое сообщение диалога."""
     if not message.from_user or message.from_user.id != ADMIN_ID:
@@ -8029,7 +8029,7 @@ async def support_admin_reply_handler(message: Message, bot: Bot) -> None:
         await message.answer("❌ Не удалось выполнить запрос. Ошибка записана в журнал.")
 
 
-@router.message(F.chat.type == "private")
+@router.message(F.chat.type == "private", F.from_user.id != ADMIN_ID)
 async def support_user_message_handler(message: Message, bot: Bot) -> None:
     """Пересылает все типы сообщений активного разрешённого диалога админу."""
     if not message.from_user or message.from_user.id == ADMIN_ID or message.from_user.is_bot:
