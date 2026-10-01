@@ -147,6 +147,14 @@ BOOSTERS = {
     "repeat": ("🔁 Повтор", "Даёт одну дополнительную попытку после проигрыша."),
     "roulette": ("🎡 Повтор рулетки", "Позволяет один раз повторить раунд рулетки."),
 }
+CASE_BOOSTERS = {
+    1: "double",
+    2: "insurance",
+    3: "free",
+    4: "bonus25",
+    5: "repeat",
+    6: "roulette",
+}
 GAME_BET_PRESETS = (100, 500, 1000, 2500, 5000, 10000, 50000, 100000)
 JACKPOT_PERCENT = 2
 JACKPOT_TICKET_STEP = 5000
@@ -212,6 +220,8 @@ CASES = {
             ("gift", 15, 2),
             ("gift", 25, 0.7),
             ("gift", 50, 0.3),
+            ("booster", 1, 3.0),
+            ("booster", 2, 3.0),
         ],
     },
     "pantera": {
@@ -229,6 +239,8 @@ CASES = {
             ("gift", 25, 0.5),
             ("gift", 50, 0.3),
             ("gift", 100, 0.2),
+            ("booster", 1, 3.0),
+            ("booster", 4, 3.0),
         ],
     },
     "spider_man": {
@@ -247,6 +259,8 @@ CASES = {
             ("gift", 15, 0.6),
             ("gift", 25, 0.15),
             ("gift", 50, 0.05),
+            ("booster", 3, 3.0),
+            ("booster", 5, 3.0),
         ],
     },
     "school": {
@@ -263,6 +277,7 @@ CASES = {
             ("gift", 15, 0.2),
             ("gift", 25, 0.04),
             ("gift", 50, 0.01),
+            ("booster", 2, 3.0),
         ],
     },
     "student": {
@@ -281,6 +296,7 @@ CASES = {
             ("gift", 25, 0.07),
             ("gift", 50, 0.02),
             ("gift", 100, 0.01),
+            ("booster", 4, 3.0),
         ],
     },
     "excellent": {
@@ -300,6 +316,7 @@ CASES = {
             ("gift", 25, 1),
             ("gift", 50, 0.6),
             ("gift", 100, 0.4),
+            ("booster", 6, 3.0),
         ],
     },
 }
@@ -424,9 +441,15 @@ GOLDEN_HOUR_UNTIL = 0.0
 MINES_GRID_SIZE = 25
 MINES_COUNT = 8
 CRASH_MULTIPLIERS = {
-    "normal": (1.00, 1.15, 1.35, 1.60, 2.00, 2.50, 3.20, 4.00, 5.00),
-    "turbo": (1.00, 1.30, 1.70, 2.20, 3.00, 4.20, 6.00, 8.00),
+    "normal": (1.00, 1.12, 1.25, 1.42, 1.65, 1.95, 2.35, 2.85, 3.50),
+    "turbo": (1.00, 1.18, 1.42, 1.75, 2.20, 2.80, 3.60, 4.70),
 }
+
+
+def crash_point(mode: str, length: int) -> int:
+    """Взрыв чаще происходит в начале; дальние множители редкие."""
+    weights = [max(1, (length + 2 - index) ** 2) for index in range(length + 1)]
+    return random.choices(range(length + 1), weights=weights, k=1)[0]
 MAX_BET = 1000000000
 
 
@@ -1369,6 +1392,20 @@ class Database:
             except aiosqlite.IntegrityError:
                 return False
 
+    async def create_booster_promo(self, code: str, booster_id: str, amount: int, max_uses: int | None) -> bool:
+        if booster_id not in BOOSTERS or amount <= 0 or (max_uses is not None and max_uses <= 0):
+            return False
+        async with connect(self.path) as db:
+            try:
+                await db.execute(
+                    "INSERT INTO promo_codes (code, reward, reward_type, case_id, case_count, max_uses, created_at) VALUES (?, ?, 'booster', ?, ?, ?, ?)",
+                    (code, amount, booster_id, amount, max_uses, time.time()),
+                )
+                await db.commit()
+                return True
+            except aiosqlite.IntegrityError:
+                return False
+
     async def delete_promo(self, code: str) -> bool:
         async with connect(self.path) as db:
             cursor = await db.execute("DELETE FROM promo_codes WHERE code=?", (code,))
@@ -1548,6 +1585,35 @@ class Database:
                     await db.execute(
                         "INSERT INTO case_keys(user_id,case_id,amount) VALUES (?,?,?) ON CONFLICT(user_id,case_id) DO UPDATE SET amount=amount+excluded.amount",
                         (user_id, case_id, amount),
+                    )
+                    await db.execute(
+                        "INSERT INTO bonus_deliveries(broadcast_id,user_id) VALUES (?,?)",
+                        (broadcast_id, user_id),
+                    )
+                await db.commit()
+                return (broadcast_id, len(users))
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def create_booster_broadcast(self, booster_id: str, amount: int = 1) -> tuple[int, int]:
+        if booster_id not in BOOSTERS or amount <= 0:
+            raise ValueError("Invalid booster broadcast")
+        async with connect(self.path, timeout=30) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute("SELECT user_id FROM bot_users ORDER BY user_id") as cur:
+                    users = [row[0] for row in await cur.fetchall()]
+                cur = await db.execute(
+                    "INSERT INTO bonus_broadcasts(amount,reward_type,case_id,created_at) VALUES (?,'booster',?,?)",
+                    (amount, booster_id, time.time()),
+                )
+                broadcast_id = cur.lastrowid
+                for user_id in users:
+                    expires = time.time() + BOOSTER_TTL
+                    await db.execute(
+                        "INSERT INTO boosters(user_id,booster_id,amount,expires_at) VALUES (?,?,?,?) ON CONFLICT(user_id,booster_id) DO UPDATE SET amount=amount+excluded.amount, expires_at=MAX(expires_at,excluded.expires_at)",
+                        (user_id, booster_id, amount, expires),
                     )
                     await db.execute(
                         "INSERT INTO bonus_deliveries(broadcast_id,user_id) VALUES (?,?)",
@@ -1972,6 +2038,11 @@ class Database:
                     await db.execute(
                         "INSERT INTO case_keys (user_id, case_id, amount) VALUES (?, ?, ?) ON CONFLICT(user_id, case_id) DO UPDATE SET amount = amount + ?",
                         (user_id, case_id, case_count, case_count),
+                    )
+                elif reward_type == "booster" and case_id in BOOSTERS:
+                    await db.execute(
+                        "INSERT INTO boosters(user_id,booster_id,amount,expires_at) VALUES (?,?,?,?) ON CONFLICT(user_id,booster_id) DO UPDATE SET amount=amount+excluded.amount, expires_at=MAX(expires_at,excluded.expires_at)",
+                        (user_id, case_id, int(case_count or reward or 1), time.time() + BOOSTER_TTL),
                     )
                 else:
                     await db.execute(
@@ -2839,6 +2910,7 @@ def start_keyboard(is_admin: bool = False, support_access: bool = False):
         [InlineKeyboardButton(text="🏆 Джекпот дня", callback_data="jackpot:view")],
         [InlineKeyboardButton(text="📦 Кейсы", callback_data="cases")],
         [InlineKeyboardButton(text="⚡ Бустеры", callback_data="boosters")],
+        [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="inventory")],
         [InlineKeyboardButton(text="⭐ Купить D-COINS", callback_data="buy_dc_menu")],
         [InlineKeyboardButton(text="❓ Как играть", callback_data="help")],
     ]
@@ -3973,6 +4045,8 @@ async def bonus_notification_worker(bot: Bot) -> None:
                 if row["reward_type"] == "case" and row["case_id"] in CASES:
                     amount_text = f"{row['amount']} ключ" if row["amount"] == 1 else f"{row['amount']} ключа"
                     notification = f"🎁 Администратор раздал всем игрокам кейсы!\n🔑 Тебе начислено: {amount_text} от кейса {CASES[row['case_id']]['title']}."
+                elif row["reward_type"] == "booster" and row["case_id"] in BOOSTERS:
+                    notification = f"🎁 Администратор раздал бустеры!\n⚡ Тебе начислено: {BOOSTERS[row['case_id']][0]} ×{row['amount']}."
                 else:
                     notification = f"🎁 Администратор раздал всем игрокам {row['amount']:,} DC!\n🪙 Монеты уже зачислены на твой баланс.".replace(
                         ",", " "
@@ -4175,6 +4249,7 @@ PLAIN_COMMANDS = {
     "createpromo",
     "deletepromo",
     "createcasepromo",
+    "createboosterpromo",
     "promos",
     "balance",
     "popolnit",
@@ -5034,6 +5109,34 @@ async def cmd_createcasepromo(message: Message, bot: Bot) -> None:
         )
 
 
+@router.message(Command("createboosterpromo"), F.chat.type == "private")
+async def cmd_createboosterpromo(message: Message, bot: Bot) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    args, hidden = parse_hidden_promo_args(message.text)
+    if len(args) not in (3, 4, 5):
+        await message.answer("Использование: /createboosterpromo КОД БУСТЕР [КОЛИЧЕСТВО] [ЛИМИТ] [скрытый]")
+        return
+    code = args[1].upper()
+    booster_id = args[2].lower()
+    aliases = {str(index): key for index, key in CASE_BOOSTERS.items()}
+    booster_id = aliases.get(booster_id, booster_id)
+    try:
+        amount = int(args[3]) if len(args) >= 4 else 1
+        max_uses = int(args[4]) if len(args) == 5 else None
+    except ValueError:
+        await message.answer("❌ Количество и лимит должны быть целыми числами.")
+        return
+    if not await db.create_booster_promo(code, booster_id, amount, max_uses):
+        await message.answer("❌ Проверь код, бустер и значения.")
+        return
+    limit_text = str(max_uses) if max_uses is not None else "без лимита"
+    visibility_text = "\n🔒 Скрытый: в канал не опубликован" if hidden else ""
+    await message.answer(f"✅ Промокод {code} создан.\n⚡ {BOOSTERS[booster_id][0]} ×{amount}\n👥 Активаций: {limit_text}{visibility_text}")
+    if not hidden:
+        await publish_promo(bot, f"🎁 Новый промокод!\n\n🔑 Код: <code>{code}</code>\n⚡ Бустер: {BOOSTERS[booster_id][0]} ×{amount}\n👥 Активаций: {limit_text}\n\nАктивировать: промо {code}")
+
+
 @router.message(Command("promos"), F.chat.type == "private")
 async def cmd_promos(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
@@ -5171,6 +5274,23 @@ async def cmd_deletepending(message: Message) -> None:
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split()
+    if len(parts) >= 3 and parts[1].lower() in {"бустер", "бустеры", "booster"}:
+        booster_id = parts[2].lower()
+        aliases = {str(index): key for index, key in CASE_BOOSTERS.items()}
+        booster_id = aliases.get(booster_id, booster_id)
+        try:
+            amount = int(parts[3]) if len(parts) >= 4 else 1
+        except ValueError:
+            await message.answer("❌ Количество бустеров должно быть целым числом.")
+            return
+        if booster_id not in BOOSTERS or amount <= 0 or amount > 100:
+            await message.answer("❌ Укажи бустер и количество от 1 до 100.")
+            return
+        broadcast_id, recipients = await db.create_booster_broadcast(booster_id, amount)
+        await message.answer(
+            f"✅ Раздача #{broadcast_id} создана.\n⚡ {BOOSTERS[booster_id][0]} ×{amount} выдано: {recipients} игрокам."
+        )
+        return
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Использование: deletepending ID")
         return
@@ -5290,7 +5410,7 @@ async def cmd_broadcast(message: Message) -> None:
         return
     if len(parts) != 2:
         await message.answer(
-            "Раздача DC: раздать СУММА\nРаздача кейсов: раздать кейс НАЗВАНИЕ [КОЛИЧЕСТВО]\n\nПримеры:\nраздать 10000\nраздать кейс blood 1"
+            "Раздача DC: раздать СУММА\nРаздача кейсов: раздать кейс НАЗВАНИЕ [КОЛИЧЕСТВО]\nРаздача бустеров: раздать бустер НАЗВАНИЕ [КОЛИЧЕСТВО]"
         )
         return
     try:
@@ -6188,6 +6308,12 @@ async def cmd_promo(message: Message) -> None:
             await message.answer(
                 f"✅ Промокод активирован!\n🎟 Получено: {CASES[case_id]['title']} × {case_count}\n🔑 Ключей: {keys}\n👥 Активаций: {limit_text}"
             )
+        elif reward_type == "booster" and case_id in BOOSTERS:
+            rows = await db.get_boosters(message.from_user.id)
+            amount = case_count or reward or 1
+            await message.answer(
+                f"✅ Промокод активирован!\n⚡ Получено: {BOOSTERS[case_id][0]} ×{amount}\n🎒 В инвентаре: {sum(row[1] for row in rows)} бустеров\n👥 Активаций: {limit_text}"
+            )
         else:
             balance = await db.get_display_balance(message.from_user.id)
             await message.answer(
@@ -6467,7 +6593,12 @@ async def show_case(callback: CallbackQuery, case_id: str) -> None:
     for reward in case["rewards"]:
         if isinstance(reward[0], str):
             kind, value, _ = reward
-            label = f"🎁 Подарок {value}⭐" if kind == "gift" else f"{value:,} DC".replace(",", " ")
+            if kind == "gift":
+                label = f"🎁 Подарок {value}⭐"
+            elif kind == "booster":
+                label = f"⚡ {BOOSTERS[CASE_BOOSTERS[int(value)]][0]}"
+            else:
+                label = f"{value:,} DC".replace(",", " ")
         else:
             value, _ = reward
             label = f"{value:,} DC".replace(",", " ")
@@ -6546,6 +6677,10 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
     if kind == "coins":
         await db.add_coins(user_id, reward)
         prize_text = f"🎉 Выпало: {reward:,} DC".replace(",", " ")
+    elif kind == "booster":
+        booster_id = CASE_BOOSTERS.get(int(reward))
+        await db.grant_booster(user_id, booster_id)
+        prize_text = f"⚡ Выпал бустер: {BOOSTERS[booster_id][0]}"
     else:
         gift_key = {15: 5, 25: 10, 50: 15, 100: 20}[reward]
         gift_id = random.choice(GIFT_IDS[gift_key])
@@ -6641,6 +6776,18 @@ async def boosters_menu(callback: CallbackQuery) -> None:
         if not rows:
             text += "\nИнвентарь пуст."
         await callback.message.edit_text(text, reply_markup=boosters_keyboard(rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "inventory")
+async def inventory_menu(callback: CallbackQuery) -> None:
+    rows = await db.get_boosters(callback.from_user.id)
+    if rows:
+        lines = [f"• {BOOSTERS[key][0]} ×{amount}" for key, amount, _ in rows]
+        text = "🎒 Инвентарь\n\n" + "\n".join(lines)
+    else:
+        text = "🎒 Инвентарь\n\nПусто. Бустеры выдаются раз в 3 дня и могут выпадать из кейсов."
+    await callback.message.edit_text(text, reply_markup=boosters_keyboard(rows))
     await callback.answer()
 
 
@@ -7013,7 +7160,7 @@ async def cmd_crash(message: Message, bot: Bot) -> None:
         "mode": mode,
         "bet": bet,
         "step": 0,
-        "crash_at": random.randrange(len(multipliers) + 1),
+        "crash_at": crash_point(mode, len(multipliers)),
         "multipliers": multipliers,
         "token": f"{message.chat.id}_{message.message_id}",
         "status": "active",
@@ -7025,10 +7172,11 @@ async def cmd_crash(message: Message, bot: Bot) -> None:
     await db.clear_active_booster(user_id)
     active_games[user_id] = game
     mode_text = "⚡ Турбо" if mode == "turbo" else "🚀 Обычный полёт"
+    booster_text = f"\n⚡ Бустер: {BOOSTERS[booster][0]}" if booster else ""
     sent = await message.reply(
         f"🚀 Ракетка (Crash)\n\n{mode_text}\n💸 Ставка: {bet:,} DC\n"
         "Чем выше летит, тем больше выигрыш. Взрыв может произойти в любой момент.\n\n"
-        f"💰 Текущий коэффициент: ×{multipliers[0]:.2f}\n💵 Можно забрать: {bet:,} DC".replace(",", " "),
+        f"💰 Текущий коэффициент: ×{multipliers[0]:.2f}\n💵 Можно забрать: {bet:,} DC{booster_text}".replace(",", " "),
         reply_markup=crash_keyboard(game),
     )
     game["message_id"] = sent.message_id
@@ -7070,9 +7218,10 @@ async def crash_callback(callback: CallbackQuery, bot: Bot) -> None:
         game["step"] = next_step
         multiplier = game["multipliers"][next_step]
         prize = int(game["bet"] * multiplier)
+        booster_note = f"\n⚡ Бустер: {BOOSTERS[game['booster']][0]}" if game.get("booster") else ""
         await callback.message.edit_text(
             f"🚀 Ракетка летит...\n\n📏 Высота: {next_step * 100} м\n"
-            f"💰 Текущий коэффициент: ×{multiplier:.2f}\n💵 Выигрыш сейчас: {prize:,} DC".replace(",", " "),
+            f"💰 Текущий коэффициент: ×{multiplier:.2f}\n💵 Выигрыш сейчас: {prize:,} DC{booster_note}".replace(",", " "),
             reply_markup=crash_keyboard(game),
         )
         await callback.answer()
@@ -8221,6 +8370,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "createpromo",
     "deletepromo",
     "createcasepromo",
+    "createboosterpromo",
     "promos",
     "balance",
     "popolnit",
@@ -8303,6 +8453,7 @@ PLAIN_COMMAND_HANDLERS = {
     "createpromo": cmd_createpromo,
     "deletepromo": cmd_deletepromo,
     "createcasepromo": cmd_createcasepromo,
+    "createboosterpromo": cmd_createboosterpromo,
     "promos": cmd_promos,
     "balance": cmd_balance,
     "popolnit": cmd_popolnit,
