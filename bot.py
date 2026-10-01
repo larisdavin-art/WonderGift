@@ -71,6 +71,7 @@ from aiogram.methods import (
 )
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -409,6 +410,7 @@ GOLDEN_HOUR_DAMAGE_LIMIT = 100000
 GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT = 100000
 GOLDEN_HOUR_KNOWLEDGE_LIMIT = 500
 GOLDEN_HOUR_GAMES_LIMIT = 20
+GOLDEN_HOUR_UNTIL = 0.0
 MINES_GRID_SIZE = 25
 MINES_COUNT = 8
 MAX_BET = 1000000000
@@ -417,6 +419,14 @@ MAX_BET = 1000000000
 def validate_config():
     if not TOKEN:
         raise ValueError("BOT_TOKEN не задан")
+
+
+def golden_hour_active() -> bool:
+    return time.time() < GOLDEN_HOUR_UNTIL
+
+
+def golden_payout(amount: int) -> int:
+    return int(amount * 2) if golden_hour_active() else int(amount)
     if ADMIN_ID <= 0 or MAIN_CHAT_ID >= 0:
         raise ValueError("ADMIN_ID должен быть положительным, MAIN_CHAT_ID — ID группы")
     for value in (
@@ -2610,7 +2620,7 @@ def mines_keyboard(game: dict, reveal: bool = False) -> InlineKeyboardMarkup:
         buttons.append(line)
     if not reveal:
         if opened:
-            prize = mines_prize(game["bet"], len(opened))
+            prize = golden_payout(mines_prize(game["bet"], len(opened)))
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -2631,7 +2641,7 @@ def mines_text(game: dict) -> str:
     )
     if safe_opened:
         multiplier = mines_multiplier(safe_opened)
-        prize = mines_prize(game["bet"], safe_opened)
+        prize = golden_payout(mines_prize(game["bet"], safe_opened))
         text += f"\n💵 Выигрыш: x{multiplier:.2f} | {prize:,} DC".replace(",", " ")
     return text
 
@@ -5232,33 +5242,22 @@ async def cmd_eventdays(message: Message) -> None:
 
 @router.message(Command("goldenhour"), F.chat.type == "private")
 async def cmd_goldenhour(message: Message, bot: Bot) -> None:
+    global GOLDEN_HOUR_UNTIL
     if message.from_user.id != ADMIN_ID:
-        return
-    if not SCHOOL_EVENT_ENABLED:
-        await message.answer("ℹ️ Школьный ивент завершён.")
         return
     parts = (message.text or "").split()
     action = parts[1].lower() if len(parts) > 1 else ""
-    usage = "Золотой час:\nзолотойчас старт\nзолотойчас статус\nзолотойчас стоп"
+    usage = "Золотой час: золотойчас старт / статус / стоп"
     if action in {"старт", "start"}:
-        status, hour = await school_event.start_golden_hour()
-        if status == "no_event":
-            await message.answer("❌ Нельзя запустить Золотой час: активного ивента нет.")
-            return
-        if status == "active":
-            remaining = max(0, int(hour["ends"] - time.time()))
+        if golden_hour_active():
+            remaining = max(0, int(GOLDEN_HOUR_UNTIL - time.time()))
             await message.answer(f"⚡ Золотой час уже идёт. Осталось {remaining // 60} мин.")
             return
+        GOLDEN_HOUR_UNTIL = time.time() + GOLDEN_HOUR_SECONDS
         text = (
             "⚡ ЗОЛОТОЙ ЧАС НАЧАЛСЯ!\n\n"
             "⏳ Длительность: 60 минут\n"
-            "⚔️ Проигранные ставки наносят x2 урон боссу\n"
-            "📚 Награды за квесты дают x2 очков знаний\n\n"
-            "Лимиты:\n"
-            f"• до {GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT:,} общего бонусного урона по боссу\n"
-            f"• до {GOLDEN_HOUR_KNOWLEDGE_LIMIT} дополнительных 📖\n"
-            f"• до {GOLDEN_HOUR_GAMES_LIMIT} игр в рейтинге\n\n"
-            "После завершения все лимиты сбросятся."
+            "💰 Все выигрыши в играх умножаются на ×2!"
         ).replace(",", " ")
         try:
             await bot.send_message(REQUIRED_CHANNEL, text)
@@ -5269,23 +5268,21 @@ async def cmd_goldenhour(message: Message, bot: Bot) -> None:
         await message.answer("✅ Золотой час запущен на 60 минут.")
         return
     if action in {"статус", "status"}:
-        hour = await school_event.golden_hour_status()
-        if not hour:
+        if not golden_hour_active():
             await message.answer("ℹ️ Сейчас Золотой час не активен.")
             return
-        remaining = max(0, int(hour["ends"] - time.time()))
+        remaining = max(0, int(GOLDEN_HOUR_UNTIL - time.time()))
         await message.answer(
             f"⚡ Золотой час активен.\n⏳ Осталось: {remaining // 60} мин. {remaining % 60} сек.\n"
-            f"⚔️ Бонусный урон: {hour['bonus_damage']:,} / {GOLDEN_HOUR_TOTAL_BONUS_DAMAGE_LIMIT:,} DC\n"
-            f"📚 Лимит знаний: {GOLDEN_HOUR_KNOWLEDGE_LIMIT} 📖".replace(",", " ")
+            "💰 Выигрыши: ×2".replace(",", " ")
         )
         return
     if action in {"стоп", "stop"}:
-        if not await school_event.stop_golden_hour():
+        if not golden_hour_active():
             await message.answer("ℹ️ Активного Золотого часа нет.")
             return
-        await golden_hour_task(bot)
-        await message.answer("✅ Золотой час завершён. Итоги опубликованы в канале.")
+        GOLDEN_HOUR_UNTIL = 0.0
+        await message.answer("✅ Золотой час завершён.")
         return
     await message.answer(usage)
 
@@ -6767,7 +6764,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     s2 = random.choice(SLOT_SYMBOLS)
     s3 = random.choice(SLOT_SYMBOLS)
     if s1 == s2 == s3:
-        win = bet * (3 if color == "green" else 2)
+        win = golden_payout(bet * 2)
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -6836,7 +6833,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     emoji_map = {"red": "🔴", "black": "⚫", "green": "🟢"}
     result_emoji = emoji_map[shown_color]
     if result_color == color:
-        win = bet * 2
+        win = golden_payout(bet * (3 if color == "green" else 2))
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -6901,7 +6898,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
         return
     rolled = random.randint(1, 6)
     if rolled == number:
-        win = bet * 2
+        win = golden_payout(bet * 2)
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -6976,7 +6973,7 @@ async def cmd_coinflip(message: Message, bot: Bot) -> None:
     result_text = "🦅 Орёл" if result == "heads" else "🔵 Решка"
     chosen_text = "🦅 Орёл" if side == "heads" else "🔵 Решка"
     if result == side:
-        prize = bet * 2
+        prize = golden_payout(bet * 2)
         await db.add_coins(user_id, prize)
         await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, True)
         balance_after = await db.get_display_balance(user_id)
@@ -7092,7 +7089,7 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
         {"safe": 1},
     )
     if len(game["opened"]) == MINES_GRID_SIZE - MINES_COUNT:
-        prize = mines_prize(game["bet"], len(game["opened"]))
+        prize = golden_payout(mines_prize(game["bet"], len(game["opened"])))
         active_games.pop(user_id, None)
         await db.add_coins(user_id, prize)
         await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
@@ -7126,7 +7123,7 @@ async def mines_cashout(callback: CallbackQuery, bot: Bot) -> None:
     if not safe_opened:
         await callback.answer("Открой хотя бы одну клетку.", show_alert=True)
         return
-    prize = mines_prize(game["bet"], safe_opened)
+    prize = golden_payout(mines_prize(game["bet"], safe_opened))
     active_games.pop(user_id, None)
     await db.add_coins(user_id, prize)
     await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
@@ -7153,7 +7150,7 @@ async def settle_scratch(user, game: dict) -> tuple[str, str, int]:
     user_id = user.id
     game["opened"] = set(range(9))
     if game["win"]:
-        prize = game["bet"] * SCRATCH_MULTIPLIER
+        prize = golden_payout(game["bet"] * SCRATCH_MULTIPLIER)
         await db.add_coins(user_id, prize)
         await school_game(user, f"scratch:{game['token']}", game["bet"], True)
         balance = await db.get_display_balance(user_id)
@@ -7352,7 +7349,7 @@ async def lottery_open_ticket(callback: CallbackQuery, bot: Bot) -> None:
         return
     active_games.pop(user_id, None)
     multiplier = float(game["board"][cell])
-    prize = int(game["bet"] * multiplier)
+    prize = golden_payout(int(game["bet"] * multiplier)) if multiplier > 0 else 0
     if prize:
         await db.add_coins(user_id, prize)
     if multiplier >= 1:
@@ -8412,6 +8409,75 @@ async def resolve_gift(message: Message):
     await message.answer(
         "Статус обновлён." if cursor.rowcount else "Нет заявки с таким ID в состоянии failed/unknown."
     )
+
+
+@router.message(Command("backupdb"), F.chat.type == "private")
+async def cmd_backupdb(message: Message, bot: Bot) -> None:
+    """Создаёт согласованный SQLite-бэкап и отправляет его администратору."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    source_path = Path(db.path).resolve()
+    if not source_path.is_file():
+        await message.answer("❌ Файл базы не найден.")
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = source_path.with_name(f"activity-backup-{stamp}.db")
+    inbox_path = Path(str(source_path) + ".inbox")
+    backup_inbox_path = Path(str(backup_path) + ".inbox")
+    try:
+        with sqlite3.connect(source_path) as source, sqlite3.connect(backup_path) as target:
+            source.backup(target)
+        if inbox_path.is_file():
+            with sqlite3.connect(inbox_path) as source, sqlite3.connect(backup_inbox_path) as target:
+                source.backup(target)
+        await bot.send_document(message.from_user.id, FSInputFile(backup_path), caption="💾 Бэкап основной базы")
+        if backup_inbox_path.is_file():
+            await bot.send_document(
+                message.from_user.id,
+                FSInputFile(backup_inbox_path),
+                caption="💾 Бэкап очереди обновлений",
+            )
+        await message.answer("✅ Бэкап отправлен. Не загружай эти файлы в GitHub.")
+    except Exception:
+        logger.exception("Database backup failed")
+        await message.answer("❌ Не удалось создать бэкап. Подробности записаны в лог.")
+    finally:
+        for path in (backup_path, backup_inbox_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove temporary backup %s", path)
+
+
+@router.message(F.document, F.chat.type == "private")
+async def receive_database_restore(message: Message, bot: Bot) -> None:
+    """Принимает только админские файлы бэкапа с подписью restoredb."""
+    if message.from_user.id != ADMIN_ID or (message.caption or "").strip().lower() != "restoredb":
+        return
+    document = message.document
+    filename = (document.file_name or "").lower()
+    is_inbox = filename.endswith(".inbox")
+    target = Path(str(db.path) + ".inbox") if is_inbox else Path(db.path)
+    temporary = target.with_name(target.name + ".uploading")
+    try:
+        await bot.download(document.file_id, destination=temporary)
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError("empty upload")
+        if not is_inbox:
+            with sqlite3.connect(temporary) as connection:
+                result = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if result != "ok":
+                raise RuntimeError(f"integrity check: {result}")
+        os.replace(temporary, target)
+        await message.answer(
+            f"✅ {'Очередь обновлений' if is_inbox else 'Основная база'} загружена. "
+            "Перезапусти Railway-сервис, чтобы бот использовал файл."
+        )
+    except Exception:
+        logger.exception("Database restore failed")
+        await message.answer("❌ Файл не принят: проверь, что это бэкап из команды backupdb.")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 async def main():
