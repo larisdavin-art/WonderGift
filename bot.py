@@ -8449,6 +8449,43 @@ async def cmd_backupdb(message: Message, bot: Bot) -> None:
                 logger.warning("Could not remove temporary backup %s", path)
 
 
+@router.message(Command("users"), F.chat.type == "private")
+async def cmd_users(message: Message, bot: Bot) -> None:
+    """Отправляет администратору список ID пользователей и балансов."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    report_path = Path(db.path).with_name("users-balances.txt")
+    try:
+        async with aiosqlite.connect(db.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            async with connection.execute(
+                "SELECT c.user_id, COALESCE(s.user_name,''), COALESCE(s.username,''), "
+                "c.balance, COALESCE(c.visual_balance,0) "
+                "FROM coins c LEFT JOIN user_stats s "
+                "ON s.user_id=c.user_id AND s.chat_id=? "
+                "ORDER BY c.balance DESC, c.user_id",
+                (MAIN_CHAT_ID,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        with report_path.open("w", encoding="utf-8") as output:
+            output.write("user_id\tname\tusername\treal_balance\tvisual_balance\n")
+            for row in rows:
+                name = str(row[1] or "").replace("\t", " ").replace("\n", " ")
+                username = str(row[2] or "").replace("\t", " ").replace("\n", " ")
+                output.write(f"{row[0]}\t{name}\t{username}\t{row[3]}\t{row[4]}\n")
+        await bot.send_document(
+            message.from_user.id,
+            FSInputFile(report_path),
+            caption=f"👥 Пользователи: {len(rows)}\nID и балансы DC",
+        )
+        await message.answer("✅ Список отправлен файлом.")
+    except Exception:
+        logger.exception("Could not build users report")
+        await message.answer("❌ Не удалось сформировать список.")
+    finally:
+        report_path.unlink(missing_ok=True)
+
+
 @router.message(F.document, F.chat.type == "private")
 async def receive_database_restore(message: Message, bot: Bot) -> None:
     """Принимает только админские файлы бэкапа с подписью restoredb."""
