@@ -2065,6 +2065,28 @@ class Database:
                 raise
 
 
+    async def reset_all_player_data(self) -> int:
+        """Полный административный сброс игровых данных без удаления пользователей."""
+        async with connect(self.path, timeout=30) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute("SELECT COUNT(*) FROM bot_users") as cur:
+                    players = int((await cur.fetchone())[0])
+                for table in (
+                    "user_stats", "wins", "daily_stats", "case_keys", "boosters", "booster_state",
+                    "balance_privacy", "pending_gifts", "premium_orders", "promo_activations",
+                    "pandora_claims", "jackpot_players", "jackpot_actions", "mini_event_players",
+                ):
+                    await db.execute(f"DELETE FROM {table}")
+                await db.execute("UPDATE coins SET balance=?, visual_balance=0, last_coin_bonus=0", (COINS_START,))
+                await db.execute("UPDATE promo_codes SET uses=0")
+                await db.commit()
+                return players
+            except Exception:
+                await db.rollback()
+                raise
+
+
 # ==================== EVENT ====================
 
 
@@ -4281,6 +4303,7 @@ PLAIN_COMMANDS = {
     "duel",
     "exchange",
     "admin",
+    "resetall",
     "bossdamage",
     "eventdays",
     "goldenhour",
@@ -5473,6 +5496,24 @@ async def cmd_admin(message: Message, bot: Bot) -> None:
     if message.from_user.id != ADMIN_ID:
         return
     await message.answer(await admin_dashboard_text(bot), reply_markup=admin_panel_keyboard())
+
+
+@router.message(Command("resetall"), F.chat.type == "private")
+async def cmd_resetall(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    if (message.text or "").strip().lower() != "/resetall confirm":
+        await message.answer(
+            "⚠️ Полный сброс удалит игровые балансы, визуальные DC, бустеры, ключи, статистику, подарочные заявки и активации промокодов.\n\n"
+            "Пользователи и сами промокоды останутся. Для подтверждения отправь:\n/resetall confirm"
+        )
+        return
+    players = await db.reset_all_player_data()
+    active_games.clear()
+    pending_game_bets.clear()
+    active_duels.clear()
+    duel_by_user.clear()
+    await message.answer(f"✅ Данные игроков обнулены. Пользователей обработано: {players}.")
 
 
 @router.message(Command("eventdays"), F.chat.type == "private")
@@ -8391,6 +8432,7 @@ PRIVATE_PLAIN_COMMANDS = {
     "coinflip",
     "lottery",
     "admin",
+    "resetall",
     "bossdamage",
     "eventdays",
     "goldenhour",
@@ -8484,6 +8526,7 @@ PLAIN_COMMAND_HANDLERS = {
     "duel": cmd_duel,
     "exchange": cmd_exchange,
     "admin": cmd_admin,
+    "resetall": cmd_resetall,
     "bossdamage": cmd_bossdamage,
     "eventdays": cmd_eventdays,
     "goldenhour": cmd_goldenhour,
@@ -9172,3 +9215,4 @@ if __name__ == "__main__":
         maintenance_main()
     else:
         asyncio.run(main())
+
