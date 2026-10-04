@@ -491,6 +491,10 @@ async def booster_loss_refund(user_id: int, bet: int, booster: str | None) -> in
             await db.add_coins(user_id, refund)
         return refund
     return 0
+
+
+def booster_can_repeat(booster: str | None, game: str) -> bool:
+    return booster == "repeat" or (booster == "roulette" and game == "roulette")
     if ADMIN_ID <= 0 or MAIN_CHAT_ID >= 0:
         raise ValueError("ADMIN_ID должен быть положительным, MAIN_CHAT_ID — ID группы")
     for value in (
@@ -2103,8 +2107,10 @@ class Database:
                     "user_stats", "wins", "daily_stats", "case_keys", "boosters", "booster_state",
                     "balance_privacy", "pending_gifts", "premium_orders", "promo_activations",
                     "pandora_claims", "jackpot_players", "jackpot_actions", "mini_event_players",
+                    "bonus_deliveries",
                 ):
                     await db.execute(f"DELETE FROM {table}")
+                await db.execute("DELETE FROM case_keys WHERE case_id IN ('school','student','excellent')")
                 await db.execute("UPDATE coins SET balance=?, visual_balance=0, last_coin_bonus=0", (COINS_START,))
                 await db.execute("UPDATE promo_codes SET uses=0")
                 await db.commit()
@@ -7270,6 +7276,17 @@ async def crash_callback(callback: CallbackQuery, bot: Bot) -> None:
     if action == "forward":
         next_step = game["step"] + 1
         if next_step >= len(game["multipliers"]) or next_step == game["crash_at"]:
+            if booster_can_repeat(game.get("booster"), "crash"):
+                game["booster"] = None
+                game["crash_at"] = len(game["multipliers"]) + 1
+                game["step"] = min(next_step, len(game["multipliers"]) - 1)
+                await callback.message.edit_text(
+                    f"🚀 Ракетка продолжила полёт!\n\n📏 Высота: {next_step * 100} м\n"
+                    "🔁 Бустер «Повтор» использован.",
+                    reply_markup=crash_keyboard(game),
+                )
+                await callback.answer("🔁 Повтор использован")
+                return
             active_games.pop(user_id, None)
             if game.get("booster") == "insurance":
                 await db.add_coins(user_id, game["bet"] // 4)
@@ -7353,6 +7370,8 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     s1 = random.choice(SLOT_SYMBOLS)
     s2 = random.choice(SLOT_SYMBOLS)
     s3 = random.choice(SLOT_SYMBOLS)
+    if not (s1 == s2 == s3) and booster_can_repeat(booster, "slots"):
+        s1, s2, s3 = random.choice(SLOT_SYMBOLS), random.choice(SLOT_SYMBOLS), random.choice(SLOT_SYMBOLS)
     if s1 == s2 == s3 and random.random() < GAME_WIN_FACTOR:
         win = booster_win_amount(golden_payout(bet * 2), booster)
         await db.add_coins(user_id, win)
@@ -7417,6 +7436,8 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
         return
     chosen_emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[color]
     result_color = random.choice(ROULETTE_WHEEL)
+    if result_color != color and booster_can_repeat(booster, "roulette"):
+        result_color = random.choice(ROULETTE_WHEEL)
     shown_color = result_color
     emoji_map = {"red": "🔴", "black": "⚫", "green": "🟢"}
     result_emoji = emoji_map[shown_color]
@@ -7484,6 +7505,8 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
         await message.reply(booster_error)
         return
     rolled = random.randint(1, 6)
+    if rolled != number and booster_can_repeat(booster, "dice"):
+        rolled = random.randint(1, 6)
     if rolled == number and random.random() < GAME_WIN_FACTOR:
         win = booster_win_amount(golden_payout(bet * 2), booster)
         await db.add_coins(user_id, win)
@@ -7555,6 +7578,8 @@ async def cmd_coinflip(message: Message, bot: Bot) -> None:
         await message.reply(booster_error)
         return
     result = random.choice(("heads", "tails"))
+    if result != side and booster_can_repeat(booster, "coinflip"):
+        result = random.choice(("heads", "tails"))
     result_text = "🦅 Орёл" if result == "heads" else "🔵 Решка"
     chosen_text = "🦅 Орёл" if side == "heads" else "🔵 Решка"
     if result == side and random.random() < GAME_WIN_FACTOR:
@@ -7656,6 +7681,16 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Эта клетка уже открыта.", show_alert=True)
         return
     if cell in game["mines"]:
+        if booster_can_repeat(game.get("booster"), "mines"):
+            game["mines"].discard(cell)
+            game["booster"] = None
+            game["opened"].add(cell)
+            await callback.message.edit_text(
+                mines_text(game) + "\n\n🔁 Бустер «Повтор» спас ставку — продолжай!",
+                reply_markup=mines_keyboard(game),
+            )
+            await callback.answer("🔁 Повтор использован")
+            return
         active_games.pop(user_id, None)
         await booster_loss_refund(user_id, game["bet"], game.get("booster"))
         boss_note = await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], False)
@@ -7788,6 +7823,8 @@ async def start_scratch_game(message: Message, bot: Bot) -> None:
         return
     casino_bet_cooldowns[user_id] = True
     win = random.random() < SCRATCH_WIN_CHANCE * GAME_WIN_FACTOR
+    if not win and booster_can_repeat(booster, "scratch"):
+        win = random.random() < SCRATCH_WIN_CHANCE
     game = {
         "game": "scratch",
         "token": secrets.token_hex(12),
@@ -7944,6 +7981,12 @@ async def lottery_open_ticket(callback: CallbackQuery, bot: Bot) -> None:
     active_games.pop(user_id, None)
     multiplier = float(game["board"][cell])
     prize = booster_win_amount(golden_payout(int(game["bet"] * multiplier)), game.get("booster")) if multiplier > 0 and random.random() < GAME_WIN_FACTOR else 0
+    if not prize and booster_can_repeat(game.get("booster"), "lottery"):
+        alternatives = [value for index, value in enumerate(game["board"]) if index != cell and float(value) > 0]
+        if alternatives:
+            multiplier = float(random.choice(alternatives))
+            prize = booster_win_amount(golden_payout(int(game["bet"] * multiplier)), None)
+        game["booster"] = None
     if prize:
         await db.add_coins(user_id, prize)
     if prize and multiplier >= 1:
