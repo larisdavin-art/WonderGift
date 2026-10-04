@@ -134,6 +134,7 @@ COINS_BONUS = 20
 COINS_VIP_BONUS = 30
 COINS_BONUS_CD = 43200
 CASINO_MIN_BET = 5
+GAME_WIN_FACTOR = 0.88
 CASINO_TIMEOUT = 300
 CASINO_BET_COOLDOWN = 10
 CASE_OPEN_COOLDOWN = 5
@@ -173,12 +174,9 @@ PANDORA_REWARDS = (
     ("coins", 10000, 10),
     ("coins", 25000, 5),
     ("coins", 50000, 1),
-    ("key", "school", 8),
-    ("key", "student", 6),
     ("key", "blood", 5),
     ("key", "spider_man", 4),
     ("key", "pantera", 3),
-    ("key", "excellent", 1),
     ("chance", 1.0, 2),
     ("gift", 15, 0.6),
     ("gift", 25, 0.25),
@@ -439,7 +437,7 @@ GOLDEN_HOUR_KNOWLEDGE_LIMIT = 500
 GOLDEN_HOUR_GAMES_LIMIT = 20
 GOLDEN_HOUR_UNTIL = 0.0
 MINES_GRID_SIZE = 25
-MINES_COUNT = 8
+MINES_COUNT = 9
 CRASH_MULTIPLIERS = {
     "normal": (1.00, 1.12, 1.25, 1.42, 1.65, 1.95, 2.35, 2.85, 3.50),
     "turbo": (1.00, 1.18, 1.42, 1.75, 2.20, 2.80, 3.60, 4.70),
@@ -464,6 +462,35 @@ def golden_hour_active() -> bool:
 
 def golden_payout(amount: int) -> int:
     return int(amount * 2) if golden_hour_active() else int(amount)
+
+
+def booster_win_amount(amount: int, booster: str | None, allow_double: bool = True) -> int:
+    if booster == "double" and allow_double:
+        amount *= 2
+    elif booster == "bonus25":
+        amount = int(amount * 1.25)
+    return amount
+
+
+async def selected_booster_for_bet(user_id: int, bet: int, balance: int) -> tuple[str | None, str | None]:
+    booster = await db.get_active_booster(user_id)
+    if booster == "double" and bet > 50000:
+        return None, "❌ С бустером x2 максимальная ставка — 50 000 DC."
+    if booster != "free" and balance < bet:
+        return None, f"❌ Недостаточно D-COINS. Реальный баланс: {balance} DC"
+    if booster != "free" and not await db.remove_coins(user_id, bet):
+        return None, "❌ Не удалось списать ставку. Попробуй ещё раз."
+    await db.clear_active_booster(user_id)
+    return booster, None
+
+
+async def booster_loss_refund(user_id: int, bet: int, booster: str | None) -> int:
+    if booster == "insurance":
+        refund = bet // 4
+        if refund:
+            await db.add_coins(user_id, refund)
+        return refund
+    return 0
     if ADMIN_ID <= 0 or MAIN_CHAT_ID >= 0:
         raise ValueError("ADMIN_ID должен быть положительным, MAIN_CHAT_ID — ID группы")
     for value in (
@@ -4091,6 +4118,8 @@ async def bonus_notification_worker(bot: Bot) -> None:
 
 async def school_game(user, token, bet, won):
     if not SCHOOL_EVENT_ENABLED:
+        if not won:
+            await jackpot_loss(user, bet, f"{token}:jackpot")
         return ""
     shield_seconds = await school_event.magister_shield_remaining()
     damage, refund = await school_event.record(
@@ -7311,24 +7340,21 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
     if not CASINO_MIN_BET <= bet <= MAX_BET:
         await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
         return
-    balance, _ = await db.get_coins(user_id)
-    if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
-        return
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
     casino_bet_cooldowns[user_id] = True
-    if not await db.remove_coins(user_id, bet):
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
         casino_bet_cooldowns.pop(user_id, None)
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        await message.reply(booster_error)
         return
     s1 = random.choice(SLOT_SYMBOLS)
     s2 = random.choice(SLOT_SYMBOLS)
     s3 = random.choice(SLOT_SYMBOLS)
-    if s1 == s2 == s3:
-        win = golden_payout(bet * 2)
+    if s1 == s2 == s3 and random.random() < GAME_WIN_FACTOR:
+        win = booster_win_amount(golden_payout(bet * 2), booster)
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -7340,6 +7366,7 @@ async def cmd_slots(message: Message, bot: Bot) -> None:
             f"🎰 Слоты\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC",
         )
     else:
+        await booster_loss_refund(user_id, bet, booster)
         boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         balance_after = await db.get_display_balance(user_id)
         await message.reply(
@@ -7378,26 +7405,24 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
     if not CASINO_MIN_BET <= bet <= MAX_BET:
         await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
         return
-    balance, _ = await db.get_coins(user_id)
-    if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
-        return
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
     casino_bet_cooldowns[user_id] = True
-    if not await db.remove_coins(user_id, bet):
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
         casino_bet_cooldowns.pop(user_id, None)
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        await message.reply(booster_error)
         return
     chosen_emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[color]
     result_color = random.choice(ROULETTE_WHEEL)
     shown_color = result_color
     emoji_map = {"red": "🔴", "black": "⚫", "green": "🟢"}
     result_emoji = emoji_map[shown_color]
-    if result_color == color:
+    if result_color == color and random.random() < GAME_WIN_FACTOR:
         win = golden_payout(bet * (3 if color == "green" else 2))
+        win = booster_win_amount(win, booster, allow_double=color != "green")
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -7409,6 +7434,7 @@ async def cmd_roulette(message: Message, bot: Bot) -> None:
             f"🎡 Рулетка\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {chosen_emoji}\nВыпало: {result_emoji}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC",
         )
     else:
+        await booster_loss_refund(user_id, bet, booster)
         boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
@@ -7447,22 +7473,19 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
     if not CASINO_MIN_BET <= bet <= MAX_BET:
         await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
         return
-    balance, _ = await db.get_coins(user_id)
-    if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
-        return
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
     casino_bet_cooldowns[user_id] = True
-    if not await db.remove_coins(user_id, bet):
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
         casino_bet_cooldowns.pop(user_id, None)
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        await message.reply(booster_error)
         return
     rolled = random.randint(1, 6)
-    if rolled == number:
-        win = golden_payout(bet * 2)
+    if rolled == number and random.random() < GAME_WIN_FACTOR:
+        win = booster_win_amount(golden_payout(bet * 2), booster)
         await db.add_coins(user_id, win)
         await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, True)
         new_balance = await db.get_display_balance(user_id)
@@ -7474,6 +7497,7 @@ async def cmd_dice(message: Message, bot: Bot) -> None:
             f"🎲 Кубик\n👤 {display_name(message.from_user)} ({user_id})\n💸 Ставка: {bet} DC на {number}\nВыпало: {rolled}\n✅ Выигрыш: {win} DC\n🪙 Баланс: {new_balance} DC",
         )
     else:
+        await booster_loss_refund(user_id, bet, booster)
         boss_note = await school_game(message.from_user, f"game:{message.chat.id}:{message.message_id}", bet, False)
         new_balance = await db.get_display_balance(user_id)
         await message.reply(
@@ -7520,24 +7544,21 @@ async def cmd_coinflip(message: Message, bot: Bot) -> None:
     if not CASINO_MIN_BET <= bet <= MAX_BET:
         await message.reply(f"❌ Минимальная ставка: {CASINO_MIN_BET} DC")
         return
-    balance, _ = await db.get_coins(user_id)
-    if balance < bet:
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
-        return
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
     casino_bet_cooldowns[user_id] = True
-    if not await db.remove_coins(user_id, bet):
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
         casino_bet_cooldowns.pop(user_id, None)
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+        await message.reply(booster_error)
         return
     result = random.choice(("heads", "tails"))
     result_text = "🦅 Орёл" if result == "heads" else "🔵 Решка"
     chosen_text = "🦅 Орёл" if side == "heads" else "🔵 Решка"
-    if result == side:
-        prize = golden_payout(bet * 2)
+    if result == side and random.random() < GAME_WIN_FACTOR:
+        prize = booster_win_amount(golden_payout(bet * 2), booster)
         await db.add_coins(user_id, prize)
         await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, True)
         balance_after = await db.get_display_balance(user_id)
@@ -7546,6 +7567,7 @@ async def cmd_coinflip(message: Message, bot: Bot) -> None:
         )
         log_result = f"✅ Выигрыш: {prize} DC"
     else:
+        await booster_loss_refund(user_id, bet, booster)
         boss_note = await school_game(message.from_user, f"coinflip:{message.chat.id}:{message.message_id}", bet, False)
         balance_after = await db.get_display_balance(user_id)
         text = f"🪙 Выпало: {result_text}\n\n❌ Ты проиграл.\n💸 Ставка: {bet:,} DC на {chosen_text}\n🪙 Баланс: {balance_after:,} DC{boss_note}".replace(
@@ -7582,9 +7604,10 @@ async def start_mines_game(message: Message) -> None:
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
-    if not await db.remove_coins(user_id, bet):
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
+        await message.reply(booster_error)
         return
     casino_bet_cooldowns[user_id] = True
     game = {
@@ -7595,6 +7618,7 @@ async def start_mines_game(message: Message) -> None:
         "opened": set(),
         "chat_id": message.chat.id,
         "expires": time.time() + CASINO_TIMEOUT,
+        "booster": booster,
     }
     active_games[user_id] = game
     sent = await message.reply(mines_text(game), reply_markup=mines_keyboard(game))
@@ -7633,6 +7657,7 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
         return
     if cell in game["mines"]:
         active_games.pop(user_id, None)
+        await booster_loss_refund(user_id, game["bet"], game.get("booster"))
         boss_note = await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], False)
         balance = await db.get_display_balance(user_id)
         await callback.message.edit_text(
@@ -7653,7 +7678,7 @@ async def mines_open_cell(callback: CallbackQuery, bot: Bot) -> None:
         {"safe": 1},
     )
     if len(game["opened"]) == MINES_GRID_SIZE - MINES_COUNT:
-        prize = golden_payout(mines_prize(game["bet"], len(game["opened"])))
+        prize = booster_win_amount(golden_payout(mines_prize(game["bet"], len(game["opened"]))), game.get("booster"))
         active_games.pop(user_id, None)
         await db.add_coins(user_id, prize)
         await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
@@ -7687,7 +7712,7 @@ async def mines_cashout(callback: CallbackQuery, bot: Bot) -> None:
     if not safe_opened:
         await callback.answer("Открой хотя бы одну клетку.", show_alert=True)
         return
-    prize = golden_payout(mines_prize(game["bet"], safe_opened))
+    prize = booster_win_amount(golden_payout(mines_prize(game["bet"], safe_opened)), game.get("booster"))
     active_games.pop(user_id, None)
     await db.add_coins(user_id, prize)
     await school_game(callback.from_user, f"mines:{game['token']}", game["bet"], True)
@@ -7714,7 +7739,7 @@ async def settle_scratch(user, game: dict) -> tuple[str, str, int]:
     user_id = user.id
     game["opened"] = set(range(9))
     if game["win"]:
-        prize = golden_payout(game["bet"] * SCRATCH_MULTIPLIER)
+        prize = booster_win_amount(golden_payout(game["bet"] * SCRATCH_MULTIPLIER), game.get("booster"))
         await db.add_coins(user_id, prize)
         await school_game(user, f"scratch:{game['token']}", game["bet"], True)
         balance = await db.get_display_balance(user_id)
@@ -7723,6 +7748,7 @@ async def settle_scratch(user, game: dict) -> tuple[str, str, int]:
         )
         log_result = f"✅ Выигрыш: {prize} DC"
     else:
+        await booster_loss_refund(user_id, game["bet"], game.get("booster"))
         boss_note = await school_game(user, f"scratch:{game['token']}", game["bet"], False)
         balance = await db.get_display_balance(user_id)
         result = f"🎟 Скретч-карты\n\n❌ Трёх одинаковых символов нет. Ты проиграл.\n💸 Ставка: {game['bet']:,} DC\n🪙 Баланс: {balance:,} DC{boss_note}".replace(
@@ -7755,12 +7781,13 @@ async def start_scratch_game(message: Message, bot: Bot) -> None:
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
-    if not await db.remove_coins(user_id, bet):
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
+        await message.reply(booster_error)
         return
     casino_bet_cooldowns[user_id] = True
-    win = random.random() < SCRATCH_WIN_CHANCE
+    win = random.random() < SCRATCH_WIN_CHANCE * GAME_WIN_FACTOR
     game = {
         "game": "scratch",
         "token": secrets.token_hex(12),
@@ -7771,6 +7798,7 @@ async def start_scratch_game(message: Message, bot: Bot) -> None:
         "balance": await db.get_display_balance(user_id),
         "chat_id": message.chat.id,
         "expires": time.time() + CASINO_TIMEOUT,
+        "booster": booster,
     }
     result, log_result, balance = await settle_scratch(message.from_user, game)
     await message.reply(result, reply_markup=scratch_keyboard(game, reveal=True))
@@ -7866,9 +7894,10 @@ async def start_lottery_game(message: Message) -> None:
     if user_id in casino_bet_cooldowns:
         await message.reply(f"⏳ Следующая ставка будет доступна через {CASINO_BET_COOLDOWN} сек.")
         return
-    if not await db.remove_coins(user_id, bet):
-        balance, _ = await db.get_coins(user_id)
-        await message.reply(f"❌ Недостаточно D-COINS!\n💰 Реальный баланс: {balance} DC")
+    balance, _ = await db.get_coins(user_id)
+    booster, booster_error = await selected_booster_for_bet(user_id, bet, balance)
+    if booster_error:
+        await message.reply(booster_error)
         return
     casino_bet_cooldowns[user_id] = True
     board = list(LOTTERY_MULTIPLIERS)
@@ -7880,6 +7909,7 @@ async def start_lottery_game(message: Message) -> None:
         "board": board,
         "chat_id": message.chat.id,
         "expires": time.time() + CASINO_TIMEOUT,
+        "booster": booster,
     }
     active_games[user_id] = game
     sent = await message.reply(lottery_text(game), reply_markup=lottery_keyboard(game))
@@ -7913,12 +7943,13 @@ async def lottery_open_ticket(callback: CallbackQuery, bot: Bot) -> None:
         return
     active_games.pop(user_id, None)
     multiplier = float(game["board"][cell])
-    prize = golden_payout(int(game["bet"] * multiplier)) if multiplier > 0 else 0
+    prize = booster_win_amount(golden_payout(int(game["bet"] * multiplier)), game.get("booster")) if multiplier > 0 and random.random() < GAME_WIN_FACTOR else 0
     if prize:
         await db.add_coins(user_id, prize)
-    if multiplier >= 1:
+    if prize and multiplier >= 1:
         boss_note = await school_game(callback.from_user, f"lottery:{game['token']}", game["bet"], True)
     else:
+        await booster_loss_refund(user_id, game["bet"], game.get("booster"))
         net_loss = game["bet"] - prize
         damage, refund = await school_event.record(
             user_id,
@@ -9215,4 +9246,3 @@ if __name__ == "__main__":
         maintenance_main()
     else:
         asyncio.run(main())
-
