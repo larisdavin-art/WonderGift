@@ -6653,7 +6653,7 @@ async def pandora_open_callback(callback: CallbackQuery, bot: Bot) -> None:
         ),
         reply_markup=pandora_keyboard(remaining),
     )
-    await send_game_log(
+    await (send_log if kind == "gift" else send_game_log)(
         bot,
         f"🎁 Ящик Пандоры\n👤 {user_name} ({user_id})\n🎉 {prize_text}\n🪙 Баланс: {balance:,} DC".replace(
             ",", " "
@@ -6782,7 +6782,7 @@ async def open_case(callback: CallbackQuery, bot: Bot, case_id: str) -> None:
         ",", " "
     )
     await callback.message.edit_text(result_text, reply_markup=case_detail_keyboard(case_id))
-    await send_game_log(
+    await (send_log if kind == "gift" else send_game_log)(
         bot,
         f"📦 Открыт кейс {case['title']}\n👤 {display_name(callback.from_user)} ({user_id})\n{payment_text}\n{prize_text}\n🪙 Баланс: {new_balance:,} DC".replace(
             ",", " "
